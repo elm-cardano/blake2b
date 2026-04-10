@@ -1,4 +1,4 @@
-module Blake2b.Internal.DecodeV1 exposing
+module Blake2b.DecodeV2 exposing
     ( MessageBlock
     , blockDecoder
     , encodeDigest

@@ -1,8 +1,7 @@
 module Blake2bTest exposing (suite)
 
 import Bitwise
-import Blake2b.V1 exposing (hash, hash224, hash256, hash512)
-import Blake2b.V2
+import Blake2b exposing (hash, hash224, hash256, hash512)
 import Bytes exposing (Bytes)
 import Bytes.Encode as Encode
 import Expect
@@ -44,7 +43,6 @@ suite =
         , convenienceFunctions
         , selfTest
         , edgeCases
-        , v2CrossCheck
         ]
 
 
@@ -330,45 +328,4 @@ edgeCases =
                             |> bytesToHex
                 in
                 Expect.notEqual d32 (String.left 64 d64)
-        ]
-
-
-v2CrossCheck : Test
-v2CrossCheck =
-    describe "V2 cross-check"
-        [ test "V2 matches V1 on empty input" <|
-            \_ ->
-                Blake2b.V2.hash512 emptyBytes
-                    |> bytesToHex
-                    |> Expect.equal (hash512 emptyBytes |> bytesToHex)
-        , test "V2 matches V1 on abc" <|
-            \_ ->
-                Blake2b.V2.hash512 (hexToBytes "616263")
-                    |> bytesToHex
-                    |> Expect.equal (hash512 (hexToBytes "616263") |> bytesToHex)
-        , test "V2 matches V1 on 128 bytes" <|
-            \_ ->
-                Blake2b.V2.hash512 (sequentialBytes 128)
-                    |> bytesToHex
-                    |> Expect.equal (hash512 (sequentialBytes 128) |> bytesToHex)
-        , test "V2 matches V1 on 129 bytes" <|
-            \_ ->
-                Blake2b.V2.hash512 (sequentialBytes 129)
-                    |> bytesToHex
-                    |> Expect.equal (hash512 (sequentialBytes 129) |> bytesToHex)
-        , test "V2 matches V1 on 255 bytes" <|
-            \_ ->
-                Blake2b.V2.hash512 (sequentialBytes 255)
-                    |> bytesToHex
-                    |> Expect.equal (hash512 (sequentialBytes 255) |> bytesToHex)
-        , test "V2 keyed matches V1" <|
-            \_ ->
-                Blake2b.V2.hash { digestLength = 64, key = katKey, data = sequentialBytes 64 }
-                    |> bytesToHex
-                    |> Expect.equal (hash { digestLength = 64, key = katKey, data = sequentialBytes 64 } |> bytesToHex)
-        , test "V2 hash256 matches V1" <|
-            \_ ->
-                Blake2b.V2.hash256 (hexToBytes "616263")
-                    |> bytesToHex
-                    |> Expect.equal (hash256 (hexToBytes "616263") |> bytesToHex)
         ]

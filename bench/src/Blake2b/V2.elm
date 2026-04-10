@@ -45,8 +45,8 @@ Base (V1):
 -}
 
 import Bitwise
-import Blake2b.Internal.Constants exposing (..)
-import Blake2b.Internal.DecodeV2 exposing (MessageBlock, blockDecoder, encodeDigest)
+import Blake2b.Constants exposing (..)
+import Blake2b.DecodeV1 exposing (MessageBlock, blockDecoder, encodeDigest)
 import Bytes exposing (Bytes, Endianness(..))
 import Bytes.Decode as Decode
 import Bytes.Encode as Encode
@@ -1924,26 +1924,24 @@ hash config =
 
         -- Build full input data (key block prepended if keyed)
         fullData =
-            case keyLen of
-                0 ->
-                    config.data
+            if keyLen > 0 then
+                Encode.encode
+                    (Encode.sequence
+                        [ Encode.bytes config.key
+                        , Encode.sequence (List.repeat (128 - keyLen) (Encode.unsignedInt8 0))
+                        , Encode.bytes config.data
+                        ]
+                    )
 
-                _ ->
-                    Encode.encode
-                        (Encode.sequence
-                            [ Encode.bytes config.key
-                            , Encode.sequence (List.repeat (128 - keyLen) (Encode.unsignedInt8 0))
-                            , Encode.bytes config.data
-                            ]
-                        )
+            else
+                config.data
 
         totalLen =
-            case keyLen of
-                0 ->
-                    dataLen
+            if keyLen > 0 then
+                128 + dataLen
 
-                _ ->
-                    128 + dataLen
+            else
+                dataLen
 
         -- Initialize hash state
         paramWord =
@@ -1999,18 +1997,17 @@ hash config =
                     )
 
         finalState =
-            case totalLen of
-                0 ->
-                    -- Empty unkeyed: compress one zero block with counter=0, final
-                    compress initState 0 0 0 0 True zeroMessageBlock
+            if totalLen == 0 then
+                -- Empty unkeyed: compress one zero block with counter=0, final
+                compress initState 0 0 0 0 True zeroMessageBlock
 
-                _ ->
-                    case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) paddedData of
-                        Just hs ->
-                            hs
+            else
+                case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) paddedData of
+                    Just hs ->
+                        hs
 
-                        Nothing ->
-                            initState
+                    Nothing ->
+                        initState
     in
     encodeDigest config.digestLength finalState
 

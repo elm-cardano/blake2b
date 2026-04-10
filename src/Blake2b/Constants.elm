@@ -1,4 +1,4 @@
-module Blake2b.Internal.Constants exposing
+module Blake2b.Constants exposing
     ( iv0Hi
     , iv0Lo
     , iv1Hi
