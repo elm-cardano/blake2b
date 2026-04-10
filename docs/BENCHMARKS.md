@@ -52,9 +52,9 @@ These variants were explored early on and later deleted. Results are kept for re
 | Positional | 578,575 | 16% slower |
 | Optimized  | 468,422 | 6% faster |
 
-### Current variants (V1 through V4)
+### Current variants (V1 through V5)
 
-V1 is the Optimized variant renamed. V2-V4 build incrementally on V1.
+V1 is the Optimized variant renamed. V2-V5 build incrementally on V1.
 
 #### 64 bytes (1 block)
 
@@ -64,6 +64,7 @@ V1 is the Optimized variant renamed. V2-V4 build incrementally on V1.
 | V2      |  4,858 | 53% faster |
 | V3      |  5,009 | 52% faster |
 | V4      |  4,311 | 59% faster |
+| V5      |  3,708 | 64% faster |
 
 #### 1024 bytes (8 blocks)
 
@@ -84,10 +85,11 @@ Compiled JS output size (single module + Elm runtime, via `elm make --output`):
 | V2      | 249,264  | 6,824    |
 | V3      | 119,163  | 4,361    |
 | V4      | ~119,000 | ~4,400   |
+| V5      | ~119,000 | ~4,400   |
 
 V2's 10 inlined round functions cause a 2.2x JS bloat. V3 consolidates to one
 round function, bringing size back near V1 with only ~3% perf cost vs V2. V4
-adds flat fields with negligible size impact.
+adds flat fields with negligible size impact. V5 changes the decoder, no size impact.
 
 ## Variant Descriptions
 
@@ -188,6 +190,26 @@ instead of two). Per-block allocations drop from ~250 to ~25.
 - Negligible JS size impact vs V3
 - `xor64` helper removed (finalization uses inline `Bitwise.xor`)
 
+### V5 (`Internal.Decode` changes)
+
+**Fixes >9-argument decoder functions.** The block decoder previously used chained helper
+functions (`decodeFrom2`..`decodeFrom14`) that accumulated all previously decoded Ints as
+arguments — up to 28 arguments for `decodeFrom14`. Functions with >9 args exceed Elm's
+F2..F9 fast path, compiling to curried chains that create ~55 intermediate closures per
+block decode.
+
+V5 restructures the decoder into a reusable `decodeQuarter` (decodes 4 words = 8 u32s
+into an 8-field `QuarterBlock` record). Four quarters are combined into the final
+`MessageBlock`. No function exceeds 8 arguments.
+
+Also changes `encodeDigest` from 17 individual Int arguments to 2 arguments
+(`Int -> { h0Hi : Int, ... } -> Bytes`), eliminating 8 curried closures per hash call.
+
+- Eliminates ~55 curried closures per block decode + ~8 per hash call
+- Adds 4 intermediate `QuarterBlock` records (8 fields each) per block decode
+- Net: ~40 allocations per block decode vs ~55+ closures previously
+- **14% faster than V4** on 64-byte input (3,708 vs 4,311 ns/run)
+
 ## Throughput Estimates
 
 Based on 1024-byte benchmarks:
@@ -209,6 +231,7 @@ Based on 1024-byte benchmarks:
 | V2         |            ~250 | WorkingVector U64 fields (16/round x 12) + message blocks |
 | V3         |            ~250 | Same as V2 + permuted message blocks |
 | V4         |             ~25 | Flat WorkingVectors (1/round) + permuted MessageBlocks |
+| V5         |             ~25 | Same as V4 (decoder overhead reduced separately) |
 
 ## Key Takeaways
 
@@ -242,3 +265,7 @@ Based on 1024-byte benchmarks:
 8. **Code size matters for maintainability, less so for V8.** V2's 2.2x JS bloat from
    10 inlined round copies had no measurable perf benefit over V3's single copy.
    V8 optimizes the single function body just as well.
+
+9. **Fix >9-arg functions everywhere, including decoders.** The block decoder's chained
+   helper functions had up to 28 arguments, creating ~55 curried closures per block.
+   Restructuring into quarter-block sub-decoders (8 args each) yielded 14% speedup.

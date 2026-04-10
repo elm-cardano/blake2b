@@ -1,4 +1,4 @@
-module Blake2b.Internal.Decode exposing
+module Blake2b.Internal.DecodeV2 exposing
     ( MessageBlock
     , blockDecoder
     , encodeDigest
@@ -115,6 +115,7 @@ Each 64-bit word is stored as lo 32 bits first, then hi 32 bits (little-endian b
 Uses 4 × decodeQuarter (8 args each) to stay within Elm's 9-argument fast path.
 The previous implementation used chained helper functions with up to 28 arguments,
 causing ~55 intermediate closure allocations per block from curried overflow.
+
 -}
 blockDecoder : Decode.Decoder MessageBlock
 blockDecoder =

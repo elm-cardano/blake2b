@@ -30,7 +30,7 @@ Base (V1):
 
 import Bitwise
 import Blake2b.Internal.Constants exposing (..)
-import Blake2b.Internal.Decode exposing (MessageBlock, blockDecoder, encodeDigest, padBlock)
+import Blake2b.Internal.DecodeV2 exposing (MessageBlock, blockDecoder, encodeDigest, padBlock)
 import Bytes exposing (Bytes, Endianness(..))
 import Bytes.Decode as Decode
 import Bytes.Encode as Encode
@@ -1879,6 +1879,22 @@ emptyBytes =
     Encode.encode (Encode.sequence [])
 
 
+{-| Pre-decoded zero block (128 zero bytes), hoisted to module level.
+Used for empty unkeyed input where we compress a single zero block.
+-}
+zeroMessageBlock : MessageBlock
+zeroMessageBlock =
+    { m0Hi = 0, m0Lo = 0, m1Hi = 0, m1Lo = 0
+    , m2Hi = 0, m2Lo = 0, m3Hi = 0, m3Lo = 0
+    , m4Hi = 0, m4Lo = 0, m5Hi = 0, m5Lo = 0
+    , m6Hi = 0, m6Lo = 0, m7Hi = 0, m7Lo = 0
+    , m8Hi = 0, m8Lo = 0, m9Hi = 0, m9Lo = 0
+    , m10Hi = 0, m10Lo = 0, m11Hi = 0, m11Lo = 0
+    , m12Hi = 0, m12Lo = 0, m13Hi = 0, m13Lo = 0
+    , m14Hi = 0, m14Lo = 0, m15Hi = 0, m15Lo = 0
+    }
+
+
 {-| Compute a BLAKE2b hash with the given digest length, key, and data.
 
     - digestLength: 1 to 64 (number of output bytes)
@@ -1942,16 +1958,7 @@ hash config =
         finalState =
             if totalLen == 0 then
                 -- Empty unkeyed: compress one zero block with counter=0, final
-                let
-                    zeroBytes =
-                        Encode.encode (Encode.sequence (List.repeat 128 (Encode.unsignedInt8 0)))
-                in
-                case Decode.decode blockDecoder zeroBytes of
-                    Just mb ->
-                        compress initState 0 0 0 0 True mb
-
-                    Nothing ->
-                        initState
+                compress initState 0 0 0 0 True zeroMessageBlock
 
             else
                 case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) fullData of
@@ -1961,23 +1968,7 @@ hash config =
                     Nothing ->
                         initState
     in
-    encodeDigest config.digestLength
-        finalState.h0Hi
-        finalState.h0Lo
-        finalState.h1Hi
-        finalState.h1Lo
-        finalState.h2Hi
-        finalState.h2Lo
-        finalState.h3Hi
-        finalState.h3Lo
-        finalState.h4Hi
-        finalState.h4Lo
-        finalState.h5Hi
-        finalState.h5Lo
-        finalState.h6Hi
-        finalState.h6Lo
-        finalState.h7Hi
-        finalState.h7Lo
+    encodeDigest config.digestLength finalState
 
 
 {-| Compute a 512-bit (64-byte) BLAKE2b hash of the given data.

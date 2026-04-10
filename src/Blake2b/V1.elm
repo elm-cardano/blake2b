@@ -30,7 +30,7 @@ Base (V1):
 
 import Bitwise
 import Blake2b.Internal.Constants exposing (..)
-import Blake2b.Internal.Decode exposing (MessageBlock, blockDecoder, encodeDigest, padBlock)
+import Blake2b.Internal.DecodeV2 exposing (MessageBlock, blockDecoder, encodeDigest, padBlock)
 import Bytes exposing (Bytes, Endianness(..))
 import Bytes.Decode as Decode
 import Bytes.Encode as Encode
@@ -1961,23 +1961,7 @@ hash config =
                     Nothing ->
                         initState
     in
-    encodeDigest config.digestLength
-        finalState.h0Hi
-        finalState.h0Lo
-        finalState.h1Hi
-        finalState.h1Lo
-        finalState.h2Hi
-        finalState.h2Lo
-        finalState.h3Hi
-        finalState.h3Lo
-        finalState.h4Hi
-        finalState.h4Lo
-        finalState.h5Hi
-        finalState.h5Lo
-        finalState.h6Hi
-        finalState.h6Lo
-        finalState.h7Hi
-        finalState.h7Lo
+    encodeDigest config.digestLength finalState
 
 
 {-| Compute a 512-bit (64-byte) BLAKE2b hash of the given data.
