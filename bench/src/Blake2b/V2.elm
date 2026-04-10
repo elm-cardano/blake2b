@@ -45,8 +45,8 @@ Base (V1):
 -}
 
 import Bitwise
-import Blake2b.Constants exposing (..)
-import Blake2b.DecodeV1 exposing (MessageBlock, blockDecoder, encodeDigest)
+import Blake2b.Constants exposing (iv0Hi, iv0Lo, iv1Hi, iv1Lo, iv2Hi, iv2Lo, iv3Hi, iv3Lo, iv4Hi, iv4Lo, iv5Hi, iv5Lo, iv6Hi, iv6Lo, iv7Hi, iv7Lo)
+import Blake2b.DecodeV2 exposing (MessageBlock, blockDecoder, encodeDigest)
 import Bytes exposing (Bytes, Endianness(..))
 import Bytes.Decode as Decode
 import Bytes.Encode as Encode
@@ -137,9 +137,11 @@ round mb v =
     let
         -- Column G0: a=v0, b=v4, c=v8, d=v12, x=m0, y=m1
         -- a1 = add64(add64(a, b), x)
+        g0_abLo : Int
         g0_abLo =
             Bitwise.shiftRightZfBy 0 (v.v0Lo + v.v4Lo)
 
+        g0_abCarry : Int
         g0_abCarry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -150,12 +152,15 @@ round mb v =
                     )
                 )
 
+        g0_abHi : Int
         g0_abHi =
             Bitwise.shiftRightZfBy 0 (v.v0Hi + v.v4Hi + g0_abCarry)
 
+        g0_a1Lo : Int
         g0_a1Lo =
             Bitwise.shiftRightZfBy 0 (g0_abLo + mb.m0Lo)
 
+        g0_a1Carry : Int
         g0_a1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -166,20 +171,25 @@ round mb v =
                     )
                 )
 
+        g0_a1Hi : Int
         g0_a1Hi =
             Bitwise.shiftRightZfBy 0 (g0_abHi + mb.m0Hi + g0_a1Carry)
 
         -- d1 = rotr32(xor64(d, a1))
+        g0_d1Hi : Int
         g0_d1Hi =
             Bitwise.xor v.v12Lo g0_a1Lo
 
+        g0_d1Lo : Int
         g0_d1Lo =
             Bitwise.xor v.v12Hi g0_a1Hi
 
         -- c1 = add64(c, d1)
+        g0_c1Lo : Int
         g0_c1Lo =
             Bitwise.shiftRightZfBy 0 (v.v8Lo + g0_d1Lo)
 
+        g0_c1Carry : Int
         g0_c1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -190,26 +200,33 @@ round mb v =
                     )
                 )
 
+        g0_c1Hi : Int
         g0_c1Hi =
             Bitwise.shiftRightZfBy 0 (v.v8Hi + g0_d1Hi + g0_c1Carry)
 
         -- b1 = rotr24(xor64(b, c1))
+        g0_b1xHi : Int
         g0_b1xHi =
             Bitwise.xor v.v4Hi g0_c1Hi
 
+        g0_b1xLo : Int
         g0_b1xLo =
             Bitwise.xor v.v4Lo g0_c1Lo
 
+        g0_b1Hi : Int
         g0_b1Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xHi) (Bitwise.shiftLeftBy 8 g0_b1xLo)
 
+        g0_b1Lo : Int
         g0_b1Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xLo) (Bitwise.shiftLeftBy 8 g0_b1xHi)
 
         -- a2 = add64(add64(a1, b1), y)
+        g0_a1b1Lo : Int
         g0_a1b1Lo =
             Bitwise.shiftRightZfBy 0 (g0_a1Lo + g0_b1Lo)
 
+        g0_a1b1Carry : Int
         g0_a1b1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -220,12 +237,15 @@ round mb v =
                     )
                 )
 
+        g0_a1b1Hi : Int
         g0_a1b1Hi =
             Bitwise.shiftRightZfBy 0 (g0_a1Hi + g0_b1Hi + g0_a1b1Carry)
 
+        g0_a2Lo : Int
         g0_a2Lo =
             Bitwise.shiftRightZfBy 0 (g0_a1b1Lo + mb.m1Lo)
 
+        g0_a2Carry : Int
         g0_a2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -236,26 +256,33 @@ round mb v =
                     )
                 )
 
+        g0_a2Hi : Int
         g0_a2Hi =
             Bitwise.shiftRightZfBy 0 (g0_a1b1Hi + mb.m1Hi + g0_a2Carry)
 
         -- d2 = rotr16(xor64(d1, a2))
+        g0_d2xHi : Int
         g0_d2xHi =
             Bitwise.xor g0_d1Hi g0_a2Hi
 
+        g0_d2xLo : Int
         g0_d2xLo =
             Bitwise.xor g0_d1Lo g0_a2Lo
 
+        g0_d2Hi : Int
         g0_d2Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xHi) (Bitwise.shiftLeftBy 16 g0_d2xLo)
 
+        g0_d2Lo : Int
         g0_d2Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xLo) (Bitwise.shiftLeftBy 16 g0_d2xHi)
 
         -- c2 = add64(c1, d2)
+        g0_c2Lo : Int
         g0_c2Lo =
             Bitwise.shiftRightZfBy 0 (g0_c1Lo + g0_d2Lo)
 
+        g0_c2Carry : Int
         g0_c2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -266,27 +293,34 @@ round mb v =
                     )
                 )
 
+        g0_c2Hi : Int
         g0_c2Hi =
             Bitwise.shiftRightZfBy 0 (g0_c1Hi + g0_d2Hi + g0_c2Carry)
 
         -- b2 = rotr63(xor64(b1, c2))
+        g0_b2xHi : Int
         g0_b2xHi =
             Bitwise.xor g0_b1Hi g0_c2Hi
 
+        g0_b2xLo : Int
         g0_b2xLo =
             Bitwise.xor g0_b1Lo g0_c2Lo
 
+        g0_b2Hi : Int
         g0_b2Hi =
             Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xHi) (Bitwise.shiftRightZfBy 31 g0_b2xLo)
 
+        g0_b2Lo : Int
         g0_b2Lo =
             Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xLo) (Bitwise.shiftRightZfBy 31 g0_b2xHi)
 
         -- Column G1: a=v1, b=v5, c=v9, d=v13, x=m2, y=m3
         -- a1 = add64(add64(a, b), x)
+        g1_abLo : Int
         g1_abLo =
             Bitwise.shiftRightZfBy 0 (v.v1Lo + v.v5Lo)
 
+        g1_abCarry : Int
         g1_abCarry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -297,12 +331,15 @@ round mb v =
                     )
                 )
 
+        g1_abHi : Int
         g1_abHi =
             Bitwise.shiftRightZfBy 0 (v.v1Hi + v.v5Hi + g1_abCarry)
 
+        g1_a1Lo : Int
         g1_a1Lo =
             Bitwise.shiftRightZfBy 0 (g1_abLo + mb.m2Lo)
 
+        g1_a1Carry : Int
         g1_a1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -313,20 +350,25 @@ round mb v =
                     )
                 )
 
+        g1_a1Hi : Int
         g1_a1Hi =
             Bitwise.shiftRightZfBy 0 (g1_abHi + mb.m2Hi + g1_a1Carry)
 
         -- d1 = rotr32(xor64(d, a1))
+        g1_d1Hi : Int
         g1_d1Hi =
             Bitwise.xor v.v13Lo g1_a1Lo
 
+        g1_d1Lo : Int
         g1_d1Lo =
             Bitwise.xor v.v13Hi g1_a1Hi
 
         -- c1 = add64(c, d1)
+        g1_c1Lo : Int
         g1_c1Lo =
             Bitwise.shiftRightZfBy 0 (v.v9Lo + g1_d1Lo)
 
+        g1_c1Carry : Int
         g1_c1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -337,26 +379,33 @@ round mb v =
                     )
                 )
 
+        g1_c1Hi : Int
         g1_c1Hi =
             Bitwise.shiftRightZfBy 0 (v.v9Hi + g1_d1Hi + g1_c1Carry)
 
         -- b1 = rotr24(xor64(b, c1))
+        g1_b1xHi : Int
         g1_b1xHi =
             Bitwise.xor v.v5Hi g1_c1Hi
 
+        g1_b1xLo : Int
         g1_b1xLo =
             Bitwise.xor v.v5Lo g1_c1Lo
 
+        g1_b1Hi : Int
         g1_b1Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xHi) (Bitwise.shiftLeftBy 8 g1_b1xLo)
 
+        g1_b1Lo : Int
         g1_b1Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xLo) (Bitwise.shiftLeftBy 8 g1_b1xHi)
 
         -- a2 = add64(add64(a1, b1), y)
+        g1_a1b1Lo : Int
         g1_a1b1Lo =
             Bitwise.shiftRightZfBy 0 (g1_a1Lo + g1_b1Lo)
 
+        g1_a1b1Carry : Int
         g1_a1b1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -367,12 +416,15 @@ round mb v =
                     )
                 )
 
+        g1_a1b1Hi : Int
         g1_a1b1Hi =
             Bitwise.shiftRightZfBy 0 (g1_a1Hi + g1_b1Hi + g1_a1b1Carry)
 
+        g1_a2Lo : Int
         g1_a2Lo =
             Bitwise.shiftRightZfBy 0 (g1_a1b1Lo + mb.m3Lo)
 
+        g1_a2Carry : Int
         g1_a2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -383,26 +435,33 @@ round mb v =
                     )
                 )
 
+        g1_a2Hi : Int
         g1_a2Hi =
             Bitwise.shiftRightZfBy 0 (g1_a1b1Hi + mb.m3Hi + g1_a2Carry)
 
         -- d2 = rotr16(xor64(d1, a2))
+        g1_d2xHi : Int
         g1_d2xHi =
             Bitwise.xor g1_d1Hi g1_a2Hi
 
+        g1_d2xLo : Int
         g1_d2xLo =
             Bitwise.xor g1_d1Lo g1_a2Lo
 
+        g1_d2Hi : Int
         g1_d2Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xHi) (Bitwise.shiftLeftBy 16 g1_d2xLo)
 
+        g1_d2Lo : Int
         g1_d2Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xLo) (Bitwise.shiftLeftBy 16 g1_d2xHi)
 
         -- c2 = add64(c1, d2)
+        g1_c2Lo : Int
         g1_c2Lo =
             Bitwise.shiftRightZfBy 0 (g1_c1Lo + g1_d2Lo)
 
+        g1_c2Carry : Int
         g1_c2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -413,27 +472,34 @@ round mb v =
                     )
                 )
 
+        g1_c2Hi : Int
         g1_c2Hi =
             Bitwise.shiftRightZfBy 0 (g1_c1Hi + g1_d2Hi + g1_c2Carry)
 
         -- b2 = rotr63(xor64(b1, c2))
+        g1_b2xHi : Int
         g1_b2xHi =
             Bitwise.xor g1_b1Hi g1_c2Hi
 
+        g1_b2xLo : Int
         g1_b2xLo =
             Bitwise.xor g1_b1Lo g1_c2Lo
 
+        g1_b2Hi : Int
         g1_b2Hi =
             Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xHi) (Bitwise.shiftRightZfBy 31 g1_b2xLo)
 
+        g1_b2Lo : Int
         g1_b2Lo =
             Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xLo) (Bitwise.shiftRightZfBy 31 g1_b2xHi)
 
         -- Column G2: a=v2, b=v6, c=v10, d=v14, x=m4, y=m5
         -- a1 = add64(add64(a, b), x)
+        g2_abLo : Int
         g2_abLo =
             Bitwise.shiftRightZfBy 0 (v.v2Lo + v.v6Lo)
 
+        g2_abCarry : Int
         g2_abCarry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -444,12 +510,15 @@ round mb v =
                     )
                 )
 
+        g2_abHi : Int
         g2_abHi =
             Bitwise.shiftRightZfBy 0 (v.v2Hi + v.v6Hi + g2_abCarry)
 
+        g2_a1Lo : Int
         g2_a1Lo =
             Bitwise.shiftRightZfBy 0 (g2_abLo + mb.m4Lo)
 
+        g2_a1Carry : Int
         g2_a1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -460,20 +529,25 @@ round mb v =
                     )
                 )
 
+        g2_a1Hi : Int
         g2_a1Hi =
             Bitwise.shiftRightZfBy 0 (g2_abHi + mb.m4Hi + g2_a1Carry)
 
         -- d1 = rotr32(xor64(d, a1))
+        g2_d1Hi : Int
         g2_d1Hi =
             Bitwise.xor v.v14Lo g2_a1Lo
 
+        g2_d1Lo : Int
         g2_d1Lo =
             Bitwise.xor v.v14Hi g2_a1Hi
 
         -- c1 = add64(c, d1)
+        g2_c1Lo : Int
         g2_c1Lo =
             Bitwise.shiftRightZfBy 0 (v.v10Lo + g2_d1Lo)
 
+        g2_c1Carry : Int
         g2_c1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -484,26 +558,33 @@ round mb v =
                     )
                 )
 
+        g2_c1Hi : Int
         g2_c1Hi =
             Bitwise.shiftRightZfBy 0 (v.v10Hi + g2_d1Hi + g2_c1Carry)
 
         -- b1 = rotr24(xor64(b, c1))
+        g2_b1xHi : Int
         g2_b1xHi =
             Bitwise.xor v.v6Hi g2_c1Hi
 
+        g2_b1xLo : Int
         g2_b1xLo =
             Bitwise.xor v.v6Lo g2_c1Lo
 
+        g2_b1Hi : Int
         g2_b1Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xHi) (Bitwise.shiftLeftBy 8 g2_b1xLo)
 
+        g2_b1Lo : Int
         g2_b1Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xLo) (Bitwise.shiftLeftBy 8 g2_b1xHi)
 
         -- a2 = add64(add64(a1, b1), y)
+        g2_a1b1Lo : Int
         g2_a1b1Lo =
             Bitwise.shiftRightZfBy 0 (g2_a1Lo + g2_b1Lo)
 
+        g2_a1b1Carry : Int
         g2_a1b1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -514,12 +595,15 @@ round mb v =
                     )
                 )
 
+        g2_a1b1Hi : Int
         g2_a1b1Hi =
             Bitwise.shiftRightZfBy 0 (g2_a1Hi + g2_b1Hi + g2_a1b1Carry)
 
+        g2_a2Lo : Int
         g2_a2Lo =
             Bitwise.shiftRightZfBy 0 (g2_a1b1Lo + mb.m5Lo)
 
+        g2_a2Carry : Int
         g2_a2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -530,26 +614,33 @@ round mb v =
                     )
                 )
 
+        g2_a2Hi : Int
         g2_a2Hi =
             Bitwise.shiftRightZfBy 0 (g2_a1b1Hi + mb.m5Hi + g2_a2Carry)
 
         -- d2 = rotr16(xor64(d1, a2))
+        g2_d2xHi : Int
         g2_d2xHi =
             Bitwise.xor g2_d1Hi g2_a2Hi
 
+        g2_d2xLo : Int
         g2_d2xLo =
             Bitwise.xor g2_d1Lo g2_a2Lo
 
+        g2_d2Hi : Int
         g2_d2Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xHi) (Bitwise.shiftLeftBy 16 g2_d2xLo)
 
+        g2_d2Lo : Int
         g2_d2Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xLo) (Bitwise.shiftLeftBy 16 g2_d2xHi)
 
         -- c2 = add64(c1, d2)
+        g2_c2Lo : Int
         g2_c2Lo =
             Bitwise.shiftRightZfBy 0 (g2_c1Lo + g2_d2Lo)
 
+        g2_c2Carry : Int
         g2_c2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -560,27 +651,34 @@ round mb v =
                     )
                 )
 
+        g2_c2Hi : Int
         g2_c2Hi =
             Bitwise.shiftRightZfBy 0 (g2_c1Hi + g2_d2Hi + g2_c2Carry)
 
         -- b2 = rotr63(xor64(b1, c2))
+        g2_b2xHi : Int
         g2_b2xHi =
             Bitwise.xor g2_b1Hi g2_c2Hi
 
+        g2_b2xLo : Int
         g2_b2xLo =
             Bitwise.xor g2_b1Lo g2_c2Lo
 
+        g2_b2Hi : Int
         g2_b2Hi =
             Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xHi) (Bitwise.shiftRightZfBy 31 g2_b2xLo)
 
+        g2_b2Lo : Int
         g2_b2Lo =
             Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xLo) (Bitwise.shiftRightZfBy 31 g2_b2xHi)
 
         -- Column G3: a=v3, b=v7, c=v11, d=v15, x=m6, y=m7
         -- a1 = add64(add64(a, b), x)
+        g3_abLo : Int
         g3_abLo =
             Bitwise.shiftRightZfBy 0 (v.v3Lo + v.v7Lo)
 
+        g3_abCarry : Int
         g3_abCarry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -591,12 +689,15 @@ round mb v =
                     )
                 )
 
+        g3_abHi : Int
         g3_abHi =
             Bitwise.shiftRightZfBy 0 (v.v3Hi + v.v7Hi + g3_abCarry)
 
+        g3_a1Lo : Int
         g3_a1Lo =
             Bitwise.shiftRightZfBy 0 (g3_abLo + mb.m6Lo)
 
+        g3_a1Carry : Int
         g3_a1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -607,20 +708,25 @@ round mb v =
                     )
                 )
 
+        g3_a1Hi : Int
         g3_a1Hi =
             Bitwise.shiftRightZfBy 0 (g3_abHi + mb.m6Hi + g3_a1Carry)
 
         -- d1 = rotr32(xor64(d, a1))
+        g3_d1Hi : Int
         g3_d1Hi =
             Bitwise.xor v.v15Lo g3_a1Lo
 
+        g3_d1Lo : Int
         g3_d1Lo =
             Bitwise.xor v.v15Hi g3_a1Hi
 
         -- c1 = add64(c, d1)
+        g3_c1Lo : Int
         g3_c1Lo =
             Bitwise.shiftRightZfBy 0 (v.v11Lo + g3_d1Lo)
 
+        g3_c1Carry : Int
         g3_c1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -631,26 +737,33 @@ round mb v =
                     )
                 )
 
+        g3_c1Hi : Int
         g3_c1Hi =
             Bitwise.shiftRightZfBy 0 (v.v11Hi + g3_d1Hi + g3_c1Carry)
 
         -- b1 = rotr24(xor64(b, c1))
+        g3_b1xHi : Int
         g3_b1xHi =
             Bitwise.xor v.v7Hi g3_c1Hi
 
+        g3_b1xLo : Int
         g3_b1xLo =
             Bitwise.xor v.v7Lo g3_c1Lo
 
+        g3_b1Hi : Int
         g3_b1Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xHi) (Bitwise.shiftLeftBy 8 g3_b1xLo)
 
+        g3_b1Lo : Int
         g3_b1Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xLo) (Bitwise.shiftLeftBy 8 g3_b1xHi)
 
         -- a2 = add64(add64(a1, b1), y)
+        g3_a1b1Lo : Int
         g3_a1b1Lo =
             Bitwise.shiftRightZfBy 0 (g3_a1Lo + g3_b1Lo)
 
+        g3_a1b1Carry : Int
         g3_a1b1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -661,12 +774,15 @@ round mb v =
                     )
                 )
 
+        g3_a1b1Hi : Int
         g3_a1b1Hi =
             Bitwise.shiftRightZfBy 0 (g3_a1Hi + g3_b1Hi + g3_a1b1Carry)
 
+        g3_a2Lo : Int
         g3_a2Lo =
             Bitwise.shiftRightZfBy 0 (g3_a1b1Lo + mb.m7Lo)
 
+        g3_a2Carry : Int
         g3_a2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -677,26 +793,33 @@ round mb v =
                     )
                 )
 
+        g3_a2Hi : Int
         g3_a2Hi =
             Bitwise.shiftRightZfBy 0 (g3_a1b1Hi + mb.m7Hi + g3_a2Carry)
 
         -- d2 = rotr16(xor64(d1, a2))
+        g3_d2xHi : Int
         g3_d2xHi =
             Bitwise.xor g3_d1Hi g3_a2Hi
 
+        g3_d2xLo : Int
         g3_d2xLo =
             Bitwise.xor g3_d1Lo g3_a2Lo
 
+        g3_d2Hi : Int
         g3_d2Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xHi) (Bitwise.shiftLeftBy 16 g3_d2xLo)
 
+        g3_d2Lo : Int
         g3_d2Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xLo) (Bitwise.shiftLeftBy 16 g3_d2xHi)
 
         -- c2 = add64(c1, d2)
+        g3_c2Lo : Int
         g3_c2Lo =
             Bitwise.shiftRightZfBy 0 (g3_c1Lo + g3_d2Lo)
 
+        g3_c2Carry : Int
         g3_c2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -707,27 +830,34 @@ round mb v =
                     )
                 )
 
+        g3_c2Hi : Int
         g3_c2Hi =
             Bitwise.shiftRightZfBy 0 (g3_c1Hi + g3_d2Hi + g3_c2Carry)
 
         -- b2 = rotr63(xor64(b1, c2))
+        g3_b2xHi : Int
         g3_b2xHi =
             Bitwise.xor g3_b1Hi g3_c2Hi
 
+        g3_b2xLo : Int
         g3_b2xLo =
             Bitwise.xor g3_b1Lo g3_c2Lo
 
+        g3_b2Hi : Int
         g3_b2Hi =
             Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xHi) (Bitwise.shiftRightZfBy 31 g3_b2xLo)
 
+        g3_b2Lo : Int
         g3_b2Lo =
             Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xLo) (Bitwise.shiftRightZfBy 31 g3_b2xHi)
 
         -- Diagonal G4: a=g0.a, b=g1.b, c=g2.c, d=g3.d, x=m8, y=m9
         -- a1 = add64(add64(a, b), x)
+        g4_abLo : Int
         g4_abLo =
             Bitwise.shiftRightZfBy 0 (g0_a2Lo + g1_b2Lo)
 
+        g4_abCarry : Int
         g4_abCarry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -738,12 +868,15 @@ round mb v =
                     )
                 )
 
+        g4_abHi : Int
         g4_abHi =
             Bitwise.shiftRightZfBy 0 (g0_a2Hi + g1_b2Hi + g4_abCarry)
 
+        g4_a1Lo : Int
         g4_a1Lo =
             Bitwise.shiftRightZfBy 0 (g4_abLo + mb.m8Lo)
 
+        g4_a1Carry : Int
         g4_a1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -754,20 +887,25 @@ round mb v =
                     )
                 )
 
+        g4_a1Hi : Int
         g4_a1Hi =
             Bitwise.shiftRightZfBy 0 (g4_abHi + mb.m8Hi + g4_a1Carry)
 
         -- d1 = rotr32(xor64(d, a1))
+        g4_d1Hi : Int
         g4_d1Hi =
             Bitwise.xor g3_d2Lo g4_a1Lo
 
+        g4_d1Lo : Int
         g4_d1Lo =
             Bitwise.xor g3_d2Hi g4_a1Hi
 
         -- c1 = add64(c, d1)
+        g4_c1Lo : Int
         g4_c1Lo =
             Bitwise.shiftRightZfBy 0 (g2_c2Lo + g4_d1Lo)
 
+        g4_c1Carry : Int
         g4_c1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -778,26 +916,33 @@ round mb v =
                     )
                 )
 
+        g4_c1Hi : Int
         g4_c1Hi =
             Bitwise.shiftRightZfBy 0 (g2_c2Hi + g4_d1Hi + g4_c1Carry)
 
         -- b1 = rotr24(xor64(b, c1))
+        g4_b1xHi : Int
         g4_b1xHi =
             Bitwise.xor g1_b2Hi g4_c1Hi
 
+        g4_b1xLo : Int
         g4_b1xLo =
             Bitwise.xor g1_b2Lo g4_c1Lo
 
+        g4_b1Hi : Int
         g4_b1Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xHi) (Bitwise.shiftLeftBy 8 g4_b1xLo)
 
+        g4_b1Lo : Int
         g4_b1Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xLo) (Bitwise.shiftLeftBy 8 g4_b1xHi)
 
         -- a2 = add64(add64(a1, b1), y)
+        g4_a1b1Lo : Int
         g4_a1b1Lo =
             Bitwise.shiftRightZfBy 0 (g4_a1Lo + g4_b1Lo)
 
+        g4_a1b1Carry : Int
         g4_a1b1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -808,12 +953,15 @@ round mb v =
                     )
                 )
 
+        g4_a1b1Hi : Int
         g4_a1b1Hi =
             Bitwise.shiftRightZfBy 0 (g4_a1Hi + g4_b1Hi + g4_a1b1Carry)
 
+        g4_a2Lo : Int
         g4_a2Lo =
             Bitwise.shiftRightZfBy 0 (g4_a1b1Lo + mb.m9Lo)
 
+        g4_a2Carry : Int
         g4_a2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -824,26 +972,33 @@ round mb v =
                     )
                 )
 
+        g4_a2Hi : Int
         g4_a2Hi =
             Bitwise.shiftRightZfBy 0 (g4_a1b1Hi + mb.m9Hi + g4_a2Carry)
 
         -- d2 = rotr16(xor64(d1, a2))
+        g4_d2xHi : Int
         g4_d2xHi =
             Bitwise.xor g4_d1Hi g4_a2Hi
 
+        g4_d2xLo : Int
         g4_d2xLo =
             Bitwise.xor g4_d1Lo g4_a2Lo
 
+        g4_d2Hi : Int
         g4_d2Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xHi) (Bitwise.shiftLeftBy 16 g4_d2xLo)
 
+        g4_d2Lo : Int
         g4_d2Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xLo) (Bitwise.shiftLeftBy 16 g4_d2xHi)
 
         -- c2 = add64(c1, d2)
+        g4_c2Lo : Int
         g4_c2Lo =
             Bitwise.shiftRightZfBy 0 (g4_c1Lo + g4_d2Lo)
 
+        g4_c2Carry : Int
         g4_c2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -854,27 +1009,34 @@ round mb v =
                     )
                 )
 
+        g4_c2Hi : Int
         g4_c2Hi =
             Bitwise.shiftRightZfBy 0 (g4_c1Hi + g4_d2Hi + g4_c2Carry)
 
         -- b2 = rotr63(xor64(b1, c2))
+        g4_b2xHi : Int
         g4_b2xHi =
             Bitwise.xor g4_b1Hi g4_c2Hi
 
+        g4_b2xLo : Int
         g4_b2xLo =
             Bitwise.xor g4_b1Lo g4_c2Lo
 
+        g4_b2Hi : Int
         g4_b2Hi =
             Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xHi) (Bitwise.shiftRightZfBy 31 g4_b2xLo)
 
+        g4_b2Lo : Int
         g4_b2Lo =
             Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xLo) (Bitwise.shiftRightZfBy 31 g4_b2xHi)
 
         -- Diagonal G5: a=g1.a, b=g2.b, c=g3.c, d=g0.d, x=m10, y=m11
         -- a1 = add64(add64(a, b), x)
+        g5_abLo : Int
         g5_abLo =
             Bitwise.shiftRightZfBy 0 (g1_a2Lo + g2_b2Lo)
 
+        g5_abCarry : Int
         g5_abCarry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -885,12 +1047,15 @@ round mb v =
                     )
                 )
 
+        g5_abHi : Int
         g5_abHi =
             Bitwise.shiftRightZfBy 0 (g1_a2Hi + g2_b2Hi + g5_abCarry)
 
+        g5_a1Lo : Int
         g5_a1Lo =
             Bitwise.shiftRightZfBy 0 (g5_abLo + mb.m10Lo)
 
+        g5_a1Carry : Int
         g5_a1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -901,20 +1066,25 @@ round mb v =
                     )
                 )
 
+        g5_a1Hi : Int
         g5_a1Hi =
             Bitwise.shiftRightZfBy 0 (g5_abHi + mb.m10Hi + g5_a1Carry)
 
         -- d1 = rotr32(xor64(d, a1))
+        g5_d1Hi : Int
         g5_d1Hi =
             Bitwise.xor g0_d2Lo g5_a1Lo
 
+        g5_d1Lo : Int
         g5_d1Lo =
             Bitwise.xor g0_d2Hi g5_a1Hi
 
         -- c1 = add64(c, d1)
+        g5_c1Lo : Int
         g5_c1Lo =
             Bitwise.shiftRightZfBy 0 (g3_c2Lo + g5_d1Lo)
 
+        g5_c1Carry : Int
         g5_c1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -925,26 +1095,33 @@ round mb v =
                     )
                 )
 
+        g5_c1Hi : Int
         g5_c1Hi =
             Bitwise.shiftRightZfBy 0 (g3_c2Hi + g5_d1Hi + g5_c1Carry)
 
         -- b1 = rotr24(xor64(b, c1))
+        g5_b1xHi : Int
         g5_b1xHi =
             Bitwise.xor g2_b2Hi g5_c1Hi
 
+        g5_b1xLo : Int
         g5_b1xLo =
             Bitwise.xor g2_b2Lo g5_c1Lo
 
+        g5_b1Hi : Int
         g5_b1Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xHi) (Bitwise.shiftLeftBy 8 g5_b1xLo)
 
+        g5_b1Lo : Int
         g5_b1Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xLo) (Bitwise.shiftLeftBy 8 g5_b1xHi)
 
         -- a2 = add64(add64(a1, b1), y)
+        g5_a1b1Lo : Int
         g5_a1b1Lo =
             Bitwise.shiftRightZfBy 0 (g5_a1Lo + g5_b1Lo)
 
+        g5_a1b1Carry : Int
         g5_a1b1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -955,12 +1132,15 @@ round mb v =
                     )
                 )
 
+        g5_a1b1Hi : Int
         g5_a1b1Hi =
             Bitwise.shiftRightZfBy 0 (g5_a1Hi + g5_b1Hi + g5_a1b1Carry)
 
+        g5_a2Lo : Int
         g5_a2Lo =
             Bitwise.shiftRightZfBy 0 (g5_a1b1Lo + mb.m11Lo)
 
+        g5_a2Carry : Int
         g5_a2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -971,26 +1151,33 @@ round mb v =
                     )
                 )
 
+        g5_a2Hi : Int
         g5_a2Hi =
             Bitwise.shiftRightZfBy 0 (g5_a1b1Hi + mb.m11Hi + g5_a2Carry)
 
         -- d2 = rotr16(xor64(d1, a2))
+        g5_d2xHi : Int
         g5_d2xHi =
             Bitwise.xor g5_d1Hi g5_a2Hi
 
+        g5_d2xLo : Int
         g5_d2xLo =
             Bitwise.xor g5_d1Lo g5_a2Lo
 
+        g5_d2Hi : Int
         g5_d2Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xHi) (Bitwise.shiftLeftBy 16 g5_d2xLo)
 
+        g5_d2Lo : Int
         g5_d2Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xLo) (Bitwise.shiftLeftBy 16 g5_d2xHi)
 
         -- c2 = add64(c1, d2)
+        g5_c2Lo : Int
         g5_c2Lo =
             Bitwise.shiftRightZfBy 0 (g5_c1Lo + g5_d2Lo)
 
+        g5_c2Carry : Int
         g5_c2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1001,27 +1188,34 @@ round mb v =
                     )
                 )
 
+        g5_c2Hi : Int
         g5_c2Hi =
             Bitwise.shiftRightZfBy 0 (g5_c1Hi + g5_d2Hi + g5_c2Carry)
 
         -- b2 = rotr63(xor64(b1, c2))
+        g5_b2xHi : Int
         g5_b2xHi =
             Bitwise.xor g5_b1Hi g5_c2Hi
 
+        g5_b2xLo : Int
         g5_b2xLo =
             Bitwise.xor g5_b1Lo g5_c2Lo
 
+        g5_b2Hi : Int
         g5_b2Hi =
             Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xHi) (Bitwise.shiftRightZfBy 31 g5_b2xLo)
 
+        g5_b2Lo : Int
         g5_b2Lo =
             Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xLo) (Bitwise.shiftRightZfBy 31 g5_b2xHi)
 
         -- Diagonal G6: a=g2.a, b=g3.b, c=g0.c, d=g1.d, x=m12, y=m13
         -- a1 = add64(add64(a, b), x)
+        g6_abLo : Int
         g6_abLo =
             Bitwise.shiftRightZfBy 0 (g2_a2Lo + g3_b2Lo)
 
+        g6_abCarry : Int
         g6_abCarry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1032,12 +1226,15 @@ round mb v =
                     )
                 )
 
+        g6_abHi : Int
         g6_abHi =
             Bitwise.shiftRightZfBy 0 (g2_a2Hi + g3_b2Hi + g6_abCarry)
 
+        g6_a1Lo : Int
         g6_a1Lo =
             Bitwise.shiftRightZfBy 0 (g6_abLo + mb.m12Lo)
 
+        g6_a1Carry : Int
         g6_a1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1048,20 +1245,25 @@ round mb v =
                     )
                 )
 
+        g6_a1Hi : Int
         g6_a1Hi =
             Bitwise.shiftRightZfBy 0 (g6_abHi + mb.m12Hi + g6_a1Carry)
 
         -- d1 = rotr32(xor64(d, a1))
+        g6_d1Hi : Int
         g6_d1Hi =
             Bitwise.xor g1_d2Lo g6_a1Lo
 
+        g6_d1Lo : Int
         g6_d1Lo =
             Bitwise.xor g1_d2Hi g6_a1Hi
 
         -- c1 = add64(c, d1)
+        g6_c1Lo : Int
         g6_c1Lo =
             Bitwise.shiftRightZfBy 0 (g0_c2Lo + g6_d1Lo)
 
+        g6_c1Carry : Int
         g6_c1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1072,26 +1274,33 @@ round mb v =
                     )
                 )
 
+        g6_c1Hi : Int
         g6_c1Hi =
             Bitwise.shiftRightZfBy 0 (g0_c2Hi + g6_d1Hi + g6_c1Carry)
 
         -- b1 = rotr24(xor64(b, c1))
+        g6_b1xHi : Int
         g6_b1xHi =
             Bitwise.xor g3_b2Hi g6_c1Hi
 
+        g6_b1xLo : Int
         g6_b1xLo =
             Bitwise.xor g3_b2Lo g6_c1Lo
 
+        g6_b1Hi : Int
         g6_b1Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xHi) (Bitwise.shiftLeftBy 8 g6_b1xLo)
 
+        g6_b1Lo : Int
         g6_b1Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xLo) (Bitwise.shiftLeftBy 8 g6_b1xHi)
 
         -- a2 = add64(add64(a1, b1), y)
+        g6_a1b1Lo : Int
         g6_a1b1Lo =
             Bitwise.shiftRightZfBy 0 (g6_a1Lo + g6_b1Lo)
 
+        g6_a1b1Carry : Int
         g6_a1b1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1102,12 +1311,15 @@ round mb v =
                     )
                 )
 
+        g6_a1b1Hi : Int
         g6_a1b1Hi =
             Bitwise.shiftRightZfBy 0 (g6_a1Hi + g6_b1Hi + g6_a1b1Carry)
 
+        g6_a2Lo : Int
         g6_a2Lo =
             Bitwise.shiftRightZfBy 0 (g6_a1b1Lo + mb.m13Lo)
 
+        g6_a2Carry : Int
         g6_a2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1118,26 +1330,33 @@ round mb v =
                     )
                 )
 
+        g6_a2Hi : Int
         g6_a2Hi =
             Bitwise.shiftRightZfBy 0 (g6_a1b1Hi + mb.m13Hi + g6_a2Carry)
 
         -- d2 = rotr16(xor64(d1, a2))
+        g6_d2xHi : Int
         g6_d2xHi =
             Bitwise.xor g6_d1Hi g6_a2Hi
 
+        g6_d2xLo : Int
         g6_d2xLo =
             Bitwise.xor g6_d1Lo g6_a2Lo
 
+        g6_d2Hi : Int
         g6_d2Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xHi) (Bitwise.shiftLeftBy 16 g6_d2xLo)
 
+        g6_d2Lo : Int
         g6_d2Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xLo) (Bitwise.shiftLeftBy 16 g6_d2xHi)
 
         -- c2 = add64(c1, d2)
+        g6_c2Lo : Int
         g6_c2Lo =
             Bitwise.shiftRightZfBy 0 (g6_c1Lo + g6_d2Lo)
 
+        g6_c2Carry : Int
         g6_c2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1148,27 +1367,34 @@ round mb v =
                     )
                 )
 
+        g6_c2Hi : Int
         g6_c2Hi =
             Bitwise.shiftRightZfBy 0 (g6_c1Hi + g6_d2Hi + g6_c2Carry)
 
         -- b2 = rotr63(xor64(b1, c2))
+        g6_b2xHi : Int
         g6_b2xHi =
             Bitwise.xor g6_b1Hi g6_c2Hi
 
+        g6_b2xLo : Int
         g6_b2xLo =
             Bitwise.xor g6_b1Lo g6_c2Lo
 
+        g6_b2Hi : Int
         g6_b2Hi =
             Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xHi) (Bitwise.shiftRightZfBy 31 g6_b2xLo)
 
+        g6_b2Lo : Int
         g6_b2Lo =
             Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xLo) (Bitwise.shiftRightZfBy 31 g6_b2xHi)
 
         -- Diagonal G7: a=g3.a, b=g0.b, c=g1.c, d=g2.d, x=m14, y=m15
         -- a1 = add64(add64(a, b), x)
+        g7_abLo : Int
         g7_abLo =
             Bitwise.shiftRightZfBy 0 (g3_a2Lo + g0_b2Lo)
 
+        g7_abCarry : Int
         g7_abCarry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1179,12 +1405,15 @@ round mb v =
                     )
                 )
 
+        g7_abHi : Int
         g7_abHi =
             Bitwise.shiftRightZfBy 0 (g3_a2Hi + g0_b2Hi + g7_abCarry)
 
+        g7_a1Lo : Int
         g7_a1Lo =
             Bitwise.shiftRightZfBy 0 (g7_abLo + mb.m14Lo)
 
+        g7_a1Carry : Int
         g7_a1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1195,20 +1424,25 @@ round mb v =
                     )
                 )
 
+        g7_a1Hi : Int
         g7_a1Hi =
             Bitwise.shiftRightZfBy 0 (g7_abHi + mb.m14Hi + g7_a1Carry)
 
         -- d1 = rotr32(xor64(d, a1))
+        g7_d1Hi : Int
         g7_d1Hi =
             Bitwise.xor g2_d2Lo g7_a1Lo
 
+        g7_d1Lo : Int
         g7_d1Lo =
             Bitwise.xor g2_d2Hi g7_a1Hi
 
         -- c1 = add64(c, d1)
+        g7_c1Lo : Int
         g7_c1Lo =
             Bitwise.shiftRightZfBy 0 (g1_c2Lo + g7_d1Lo)
 
+        g7_c1Carry : Int
         g7_c1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1219,26 +1453,33 @@ round mb v =
                     )
                 )
 
+        g7_c1Hi : Int
         g7_c1Hi =
             Bitwise.shiftRightZfBy 0 (g1_c2Hi + g7_d1Hi + g7_c1Carry)
 
         -- b1 = rotr24(xor64(b, c1))
+        g7_b1xHi : Int
         g7_b1xHi =
             Bitwise.xor g0_b2Hi g7_c1Hi
 
+        g7_b1xLo : Int
         g7_b1xLo =
             Bitwise.xor g0_b2Lo g7_c1Lo
 
+        g7_b1Hi : Int
         g7_b1Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xHi) (Bitwise.shiftLeftBy 8 g7_b1xLo)
 
+        g7_b1Lo : Int
         g7_b1Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xLo) (Bitwise.shiftLeftBy 8 g7_b1xHi)
 
         -- a2 = add64(add64(a1, b1), y)
+        g7_a1b1Lo : Int
         g7_a1b1Lo =
             Bitwise.shiftRightZfBy 0 (g7_a1Lo + g7_b1Lo)
 
+        g7_a1b1Carry : Int
         g7_a1b1Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1249,12 +1490,15 @@ round mb v =
                     )
                 )
 
+        g7_a1b1Hi : Int
         g7_a1b1Hi =
             Bitwise.shiftRightZfBy 0 (g7_a1Hi + g7_b1Hi + g7_a1b1Carry)
 
+        g7_a2Lo : Int
         g7_a2Lo =
             Bitwise.shiftRightZfBy 0 (g7_a1b1Lo + mb.m15Lo)
 
+        g7_a2Carry : Int
         g7_a2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1265,26 +1509,33 @@ round mb v =
                     )
                 )
 
+        g7_a2Hi : Int
         g7_a2Hi =
             Bitwise.shiftRightZfBy 0 (g7_a1b1Hi + mb.m15Hi + g7_a2Carry)
 
         -- d2 = rotr16(xor64(d1, a2))
+        g7_d2xHi : Int
         g7_d2xHi =
             Bitwise.xor g7_d1Hi g7_a2Hi
 
+        g7_d2xLo : Int
         g7_d2xLo =
             Bitwise.xor g7_d1Lo g7_a2Lo
 
+        g7_d2Hi : Int
         g7_d2Hi =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xHi) (Bitwise.shiftLeftBy 16 g7_d2xLo)
 
+        g7_d2Lo : Int
         g7_d2Lo =
             Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xLo) (Bitwise.shiftLeftBy 16 g7_d2xHi)
 
         -- c2 = add64(c1, d2)
+        g7_c2Lo : Int
         g7_c2Lo =
             Bitwise.shiftRightZfBy 0 (g7_c1Lo + g7_d2Lo)
 
+        g7_c2Carry : Int
         g7_c2Carry =
             Bitwise.shiftRightZfBy 31
                 (Bitwise.or
@@ -1295,19 +1546,24 @@ round mb v =
                     )
                 )
 
+        g7_c2Hi : Int
         g7_c2Hi =
             Bitwise.shiftRightZfBy 0 (g7_c1Hi + g7_d2Hi + g7_c2Carry)
 
         -- b2 = rotr63(xor64(b1, c2))
+        g7_b2xHi : Int
         g7_b2xHi =
             Bitwise.xor g7_b1Hi g7_c2Hi
 
+        g7_b2xLo : Int
         g7_b2xLo =
             Bitwise.xor g7_b1Lo g7_c2Lo
 
+        g7_b2Hi : Int
         g7_b2Hi =
             Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xHi) (Bitwise.shiftRightZfBy 31 g7_b2xLo)
 
+        g7_b2Lo : Int
         g7_b2Lo =
             Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
     in
@@ -1354,6 +1610,7 @@ compress : HashState -> Int -> Int -> Int -> Int -> Bool -> MessageBlock -> Hash
 compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
     let
         -- Initialize working vector (IVs from module-level constants)
+        initV : WorkingVector
         initV =
             { v0Hi = h.h0Hi
             , v0Lo = h.h0Lo
@@ -1400,10 +1657,12 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
             }
 
         -- Round 0 (SIGMA[0] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 })
+        vR0 : WorkingVector
         vR0 =
             round mb initV
 
         -- Round 1 (SIGMA[1] = { 14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3 })
+        vR1 : WorkingVector
         vR1 =
             round
                 { m0Hi = mb.m14Hi
@@ -1442,6 +1701,7 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
                 vR0
 
         -- Round 2 (SIGMA[2] = { 11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4 })
+        vR2 : WorkingVector
         vR2 =
             round
                 { m0Hi = mb.m11Hi
@@ -1480,6 +1740,7 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
                 vR1
 
         -- Round 3 (SIGMA[3] = { 7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8 })
+        vR3 : WorkingVector
         vR3 =
             round
                 { m0Hi = mb.m7Hi
@@ -1518,6 +1779,7 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
                 vR2
 
         -- Round 4 (SIGMA[4] = { 9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13 })
+        vR4 : WorkingVector
         vR4 =
             round
                 { m0Hi = mb.m9Hi
@@ -1556,6 +1818,7 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
                 vR3
 
         -- Round 5 (SIGMA[5] = { 2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9 })
+        vR5 : WorkingVector
         vR5 =
             round
                 { m0Hi = mb.m2Hi
@@ -1594,6 +1857,7 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
                 vR4
 
         -- Round 6 (SIGMA[6] = { 12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11 })
+        vR6 : WorkingVector
         vR6 =
             round
                 { m0Hi = mb.m12Hi
@@ -1632,6 +1896,7 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
                 vR5
 
         -- Round 7 (SIGMA[7] = { 13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10 })
+        vR7 : WorkingVector
         vR7 =
             round
                 { m0Hi = mb.m13Hi
@@ -1670,6 +1935,7 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
                 vR6
 
         -- Round 8 (SIGMA[8] = { 6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5 })
+        vR8 : WorkingVector
         vR8 =
             round
                 { m0Hi = mb.m6Hi
@@ -1708,6 +1974,7 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
                 vR7
 
         -- Round 9 (SIGMA[9] = { 10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0 })
+        vR9 : WorkingVector
         vR9 =
             round
                 { m0Hi = mb.m10Hi
@@ -1746,10 +2013,12 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
                 vR8
 
         -- Round 10 (SIGMA[0] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 })
+        vR10 : WorkingVector
         vR10 =
             round mb vR9
 
         -- Round 11 (SIGMA[1] = { 14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3 })
+        vR11 : WorkingVector
         vR11 =
             round
                 { m0Hi = mb.m14Hi
@@ -1826,9 +2095,11 @@ blockLoop acc =
         Decode.map
             (\mb ->
                 let
+                    newT0Lo : Int
                     newT0Lo =
                         Bitwise.shiftRightZfBy 0 (acc.t0Lo + 128)
 
+                    newT0Hi : Int
                     newT0Hi =
                         acc.t0Hi + counterCarry acc.t0Lo newT0Lo
                 in
@@ -1846,9 +2117,11 @@ blockLoop acc =
         Decode.map
             (\mb ->
                 let
+                    newT0Lo : Int
                     newT0Lo =
                         Bitwise.shiftRightZfBy 0 (acc.t0Lo + acc.remaining)
 
+                    newT0Hi : Int
                     newT0Hi =
                         acc.t0Hi + counterCarry acc.t0Lo newT0Lo
                 in
@@ -1916,26 +2189,15 @@ zeroMessageBlock =
 hash : { digestLength : Int, key : Bytes, data : Bytes } -> Bytes
 hash config =
     let
+        keyLen : Int
         keyLen =
             Bytes.width config.key
 
+        dataLen : Int
         dataLen =
             Bytes.width config.data
 
-        -- Build full input data (key block prepended if keyed)
-        fullData =
-            if keyLen > 0 then
-                Encode.encode
-                    (Encode.sequence
-                        [ Encode.bytes config.key
-                        , Encode.sequence (List.repeat (128 - keyLen) (Encode.unsignedInt8 0))
-                        , Encode.bytes config.data
-                        ]
-                    )
-
-            else
-                config.data
-
+        totalLen : Int
         totalLen =
             if keyLen > 0 then
                 128 + dataLen
@@ -1944,9 +2206,11 @@ hash config =
                 dataLen
 
         -- Initialize hash state
+        paramWord : Int
         paramWord =
             Bitwise.or (Bitwise.or 0x01010000 (Bitwise.shiftLeftBy 8 keyLen)) config.digestLength
 
+        initState : HashState
         initState =
             { h0Hi = iv0Hi
             , h0Lo = Bitwise.xor iv0Lo paramWord
@@ -1966,42 +2230,64 @@ hash config =
             , h7Lo = iv7Lo
             }
 
-        -- Pre-pad input to a multiple of 128 bytes so the loop always
-        -- reads full blocks. Avoids the pad+re-decode round-trip for
-        -- partial last blocks.
-        paddedData =
-            let
-                remainder =
-                    remainderBy 128 totalLen
-            in
-            if totalLen == 0 || remainder == 0 then
-                fullData
-
-            else
-                let
-                    padNeeded =
-                        128 - remainder
-
-                    zeroU32s =
-                        padNeeded // 4
-
-                    tailU8s =
-                        remainderBy 4 padNeeded
-                in
-                Encode.encode
-                    (Encode.sequence
-                        [ Encode.bytes fullData
-                        , Encode.sequence (List.repeat zeroU32s (Encode.unsignedInt32 LE 0))
-                        , Encode.sequence (List.repeat tailU8s (Encode.unsignedInt8 0))
-                        ]
-                    )
-
+        finalState : HashState
         finalState =
             if totalLen == 0 then
                 -- Empty unkeyed: compress one zero block with counter=0, final
                 compress initState 0 0 0 0 True zeroMessageBlock
 
             else
+                let
+                    -- Pre-pad input to a multiple of 128 bytes so the loop always
+                    -- reads full blocks. Avoids the pad+re-decode round-trip for
+                    -- partial last blocks.
+                    paddedData : Bytes
+                    paddedData =
+                        let
+                            -- Build full input data (key block prepended if keyed)
+                            fullData : Bytes
+                            fullData =
+                                if keyLen > 0 then
+                                    Encode.encode
+                                        (Encode.sequence
+                                            [ Encode.bytes config.key
+                                            , Encode.sequence (List.repeat (128 - keyLen) (Encode.unsignedInt8 0))
+                                            , Encode.bytes config.data
+                                            ]
+                                        )
+
+                                else
+                                    config.data
+
+                            remainder : Int
+                            remainder =
+                                remainderBy 128 totalLen
+                        in
+                        if remainder == 0 then
+                            fullData
+
+                        else
+                            let
+                                padNeeded : Int
+                                padNeeded =
+                                    128 - remainder
+
+                                zeroU32s : Int
+                                zeroU32s =
+                                    padNeeded // 4
+
+                                tailU8s : Int
+                                tailU8s =
+                                    remainderBy 4 padNeeded
+                            in
+                            Encode.encode
+                                (Encode.sequence
+                                    [ Encode.bytes fullData
+                                    , Encode.sequence (List.repeat zeroU32s (Encode.unsignedInt32 LE 0))
+                                    , Encode.sequence (List.repeat tailU8s (Encode.unsignedInt8 0))
+                                    ]
+                                )
+                in
                 case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) paddedData of
                     Just hs ->
                         hs

@@ -2,7 +2,6 @@ module Blake2b.DecodeV1 exposing
     ( MessageBlock
     , blockDecoder
     , encodeDigest
-    , padBlock
     )
 
 import Bytes exposing (Bytes, Endianness(..))
@@ -177,6 +176,7 @@ producing 64 bytes total, then the first digestLength bytes are extracted.
 encodeDigest : Int -> { h0Hi : Int, h0Lo : Int, h1Hi : Int, h1Lo : Int, h2Hi : Int, h2Lo : Int, h3Hi : Int, h3Lo : Int, h4Hi : Int, h4Lo : Int, h5Hi : Int, h5Lo : Int, h6Hi : Int, h6Lo : Int, h7Hi : Int, h7Lo : Int } -> Bytes
 encodeDigest digestLength h =
     let
+        full : Bytes
         full =
             Encode.encode
                 (Encode.sequence
@@ -205,22 +205,3 @@ encodeDigest digestLength h =
 
         Nothing ->
             full
-
-
-{-| Pad a partial block (0-127 bytes) with zeros to make a full 128-byte block.
--}
-padBlock : Bytes -> Bytes
-padBlock partial =
-    let
-        len =
-            Bytes.width partial
-
-        padLen =
-            128 - len
-    in
-    Encode.encode
-        (Encode.sequence
-            [ Encode.bytes partial
-            , Encode.sequence (List.repeat padLen (Encode.unsignedInt8 0))
-            ]
-        )

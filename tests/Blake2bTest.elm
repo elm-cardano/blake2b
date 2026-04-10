@@ -177,11 +177,14 @@ convenienceFunctions =
 selftestSeq : Int -> Int -> Bytes
 selftestSeq len seed =
     let
+        a0 : Int
         a0 =
             Bitwise.shiftRightZfBy 0 (0xDEAD4BAD * seed)
 
+        generate : Int -> ( Int, Int, List Encode.Encoder ) -> ( Int, Int, List Encode.Encoder )
         generate _ ( a, b, acc ) =
             let
+                t : Int
                 t =
                     Bitwise.shiftRightZfBy 0 (a + b)
             in
@@ -209,24 +212,30 @@ selfTest =
         [ test "grand hash of all test outputs equals expected BLAKE2b-256 digest" <|
             \_ ->
                 let
+                    mdLens : List Int
                     mdLens =
                         [ 20, 32, 48, 64 ]
 
+                    inLens : List Int
                     inLens =
                         [ 0, 3, 128, 129, 255, 1024 ]
 
+                    allOutputs : Bytes
                     allOutputs =
                         List.foldl
                             (\outlen outerAcc ->
                                 List.foldl
                                     (\inlen innerAcc ->
                                         let
+                                            inputData : Bytes
                                             inputData =
                                                 selftestSeq inlen inlen
 
+                                            key : Bytes
                                             key =
                                                 selftestSeq outlen outlen
 
+                                            unkeyed : Bytes
                                             unkeyed =
                                                 hash
                                                     { digestLength = outlen
@@ -234,6 +243,7 @@ selfTest =
                                                     , data = inputData
                                                     }
 
+                                            keyed : Bytes
                                             keyed =
                                                 hash
                                                     { digestLength = outlen
@@ -249,6 +259,7 @@ selfTest =
                             emptyBytes
                             mdLens
 
+                    grandHash : Bytes
                     grandHash =
                         hash
                             { digestLength = 32
@@ -272,6 +283,7 @@ edgeCases =
         [ test "127 bytes (one byte short of a full block)" <|
             \_ ->
                 let
+                    result : String
                     result =
                         hash { digestLength = 64, key = katKey, data = sequentialBytes 127 }
                             |> bytesToHex
@@ -287,6 +299,7 @@ edgeCases =
         , test "129 bytes (one byte past a full block)" <|
             \_ ->
                 let
+                    result : String
                     result =
                         hash { digestLength = 64, key = katKey, data = sequentialBytes 129 }
                             |> bytesToHex
@@ -301,6 +314,7 @@ edgeCases =
         , test "unkeyed hash with 128-byte message" <|
             \_ ->
                 let
+                    result : String
                     result =
                         hash { digestLength = 64, key = emptyBytes, data = sequentialBytes 128 }
                             |> bytesToHex
@@ -310,6 +324,7 @@ edgeCases =
         , test "unkeyed hash with 129-byte message" <|
             \_ ->
                 let
+                    result : String
                     result =
                         hash { digestLength = 64, key = emptyBytes, data = sequentialBytes 129 }
                             |> bytesToHex
@@ -319,10 +334,12 @@ edgeCases =
         , test "different digest lengths produce different results" <|
             \_ ->
                 let
+                    d32 : String
                     d32 =
                         hash { digestLength = 32, key = emptyBytes, data = hexToBytes "616263" }
                             |> bytesToHex
 
+                    d64 : String
                     d64 =
                         hash { digestLength = 64, key = emptyBytes, data = hexToBytes "616263" }
                             |> bytesToHex

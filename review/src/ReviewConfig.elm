@@ -65,4 +65,3 @@ config =
     , NoUnused.Variables.rule
     , Simplify.rule Simplify.defaults
     ]
-    |> List.map (Rule.ignoreErrorsForFiles [ "src/Blake2b/V1.elm", "src/Blake2b/Internal/DecodeV1.elm", "src/Blake2b/Internal/Constants.elm" ])

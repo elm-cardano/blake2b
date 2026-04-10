@@ -10,9 +10,11 @@ import Bytes.Encode as Encode
 hexToBytes : String -> Bytes
 hexToBytes hexStr =
     let
+        chars : List Char
         chars =
             String.toList hexStr
 
+        pairs : List Int
         pairs =
             toPairs chars []
     in
@@ -32,6 +34,7 @@ toPairs chars acc =
 hexCharToInt : Char -> Int
 hexCharToInt c =
     let
+        code : Int
         code =
             Char.toCode c
     in
@@ -81,9 +84,11 @@ bytesToHexStep ( remaining, acc ) =
 byteToHex : Int -> String
 byteToHex byte =
     let
+        hi : Char
         hi =
             nibbleToChar (byte // 16)
 
+        lo : Char
         lo =
             nibbleToChar (modBy 16 byte)
     in
