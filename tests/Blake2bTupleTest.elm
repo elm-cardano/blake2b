@@ -141,22 +141,30 @@ convenienceFunctions =
                     |> bytesToHex
                     |> Expect.equal
                         "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"
-        , test "hash256 of empty string matches hash with digestLength=32" <|
+        , test "hash256 of empty string matches reference vector" <|
             \_ ->
                 hash256 emptyBytes
                     |> bytesToHex
                     |> Expect.equal
-                        (hash { digestLength = 32, key = emptyBytes, data = emptyBytes }
-                            |> bytesToHex
-                        )
-        , test "hash224 of empty string matches hash with digestLength=28" <|
+                        "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8"
+        , test "hash256 of \"abc\" matches reference vector" <|
+            \_ ->
+                hash256 (hexToBytes "616263")
+                    |> bytesToHex
+                    |> Expect.equal
+                        "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319"
+        , test "hash224 of empty string matches reference vector" <|
             \_ ->
                 hash224 emptyBytes
                     |> bytesToHex
                     |> Expect.equal
-                        (hash { digestLength = 28, key = emptyBytes, data = emptyBytes }
-                            |> bytesToHex
-                        )
+                        "836cc68931c2e4e3e838602eca1902591d216837bafddfe6f0c8cb07"
+        , test "hash224 of \"abc\" matches reference vector" <|
+            \_ ->
+                hash224 (hexToBytes "616263")
+                    |> bytesToHex
+                    |> Expect.equal
+                        "9bd237b02a29e43bdd6738afa5b53ff0eee178d6210b618e4511aec8"
         ]
 
 
