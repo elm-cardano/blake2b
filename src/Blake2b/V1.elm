@@ -1871,14 +1871,38 @@ Used for empty unkeyed input where we compress a single zero block.
 -}
 zeroMessageBlock : MessageBlock
 zeroMessageBlock =
-    { m0Hi = 0, m0Lo = 0, m1Hi = 0, m1Lo = 0
-    , m2Hi = 0, m2Lo = 0, m3Hi = 0, m3Lo = 0
-    , m4Hi = 0, m4Lo = 0, m5Hi = 0, m5Lo = 0
-    , m6Hi = 0, m6Lo = 0, m7Hi = 0, m7Lo = 0
-    , m8Hi = 0, m8Lo = 0, m9Hi = 0, m9Lo = 0
-    , m10Hi = 0, m10Lo = 0, m11Hi = 0, m11Lo = 0
-    , m12Hi = 0, m12Lo = 0, m13Hi = 0, m13Lo = 0
-    , m14Hi = 0, m14Lo = 0, m15Hi = 0, m15Lo = 0
+    { m0Hi = 0
+    , m0Lo = 0
+    , m1Hi = 0
+    , m1Lo = 0
+    , m2Hi = 0
+    , m2Lo = 0
+    , m3Hi = 0
+    , m3Lo = 0
+    , m4Hi = 0
+    , m4Lo = 0
+    , m5Hi = 0
+    , m5Lo = 0
+    , m6Hi = 0
+    , m6Lo = 0
+    , m7Hi = 0
+    , m7Lo = 0
+    , m8Hi = 0
+    , m8Lo = 0
+    , m9Hi = 0
+    , m9Lo = 0
+    , m10Hi = 0
+    , m10Lo = 0
+    , m11Hi = 0
+    , m11Lo = 0
+    , m12Hi = 0
+    , m12Lo = 0
+    , m13Hi = 0
+    , m13Lo = 0
+    , m14Hi = 0
+    , m14Lo = 0
+    , m15Hi = 0
+    , m15Lo = 0
     }
 
 

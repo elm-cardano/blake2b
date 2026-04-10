@@ -1871,14 +1871,38 @@ Used for empty unkeyed input where we compress a single zero block.
 -}
 zeroMessageBlock : MessageBlock
 zeroMessageBlock =
-    { m0Hi = 0, m0Lo = 0, m1Hi = 0, m1Lo = 0
-    , m2Hi = 0, m2Lo = 0, m3Hi = 0, m3Lo = 0
-    , m4Hi = 0, m4Lo = 0, m5Hi = 0, m5Lo = 0
-    , m6Hi = 0, m6Lo = 0, m7Hi = 0, m7Lo = 0
-    , m8Hi = 0, m8Lo = 0, m9Hi = 0, m9Lo = 0
-    , m10Hi = 0, m10Lo = 0, m11Hi = 0, m11Lo = 0
-    , m12Hi = 0, m12Lo = 0, m13Hi = 0, m13Lo = 0
-    , m14Hi = 0, m14Lo = 0, m15Hi = 0, m15Lo = 0
+    { m0Hi = 0
+    , m0Lo = 0
+    , m1Hi = 0
+    , m1Lo = 0
+    , m2Hi = 0
+    , m2Lo = 0
+    , m3Hi = 0
+    , m3Lo = 0
+    , m4Hi = 0
+    , m4Lo = 0
+    , m5Hi = 0
+    , m5Lo = 0
+    , m6Hi = 0
+    , m6Lo = 0
+    , m7Hi = 0
+    , m7Lo = 0
+    , m8Hi = 0
+    , m8Lo = 0
+    , m9Hi = 0
+    , m9Lo = 0
+    , m10Hi = 0
+    , m10Lo = 0
+    , m11Hi = 0
+    , m11Lo = 0
+    , m12Hi = 0
+    , m12Lo = 0
+    , m13Hi = 0
+    , m13Lo = 0
+    , m14Hi = 0
+    , m14Lo = 0
+    , m15Hi = 0
+    , m15Lo = 0
     }
 
 
@@ -1900,24 +1924,26 @@ hash config =
 
         -- Build full input data (key block prepended if keyed)
         fullData =
-            if keyLen > 0 then
-                Encode.encode
-                    (Encode.sequence
-                        [ Encode.bytes config.key
-                        , Encode.sequence (List.repeat (128 - keyLen) (Encode.unsignedInt8 0))
-                        , Encode.bytes config.data
-                        ]
-                    )
+            case keyLen of
+                0 ->
+                    config.data
 
-            else
-                config.data
+                _ ->
+                    Encode.encode
+                        (Encode.sequence
+                            [ Encode.bytes config.key
+                            , Encode.sequence (List.repeat (128 - keyLen) (Encode.unsignedInt8 0))
+                            , Encode.bytes config.data
+                            ]
+                        )
 
         totalLen =
-            if keyLen > 0 then
-                128 + dataLen
+            case keyLen of
+                0 ->
+                    dataLen
 
-            else
-                dataLen
+                _ ->
+                    128 + dataLen
 
         -- Initialize hash state
         paramWord =
@@ -1973,17 +1999,18 @@ hash config =
                     )
 
         finalState =
-            if totalLen == 0 then
-                -- Empty unkeyed: compress one zero block with counter=0, final
-                compress initState 0 0 0 0 True zeroMessageBlock
+            case totalLen of
+                0 ->
+                    -- Empty unkeyed: compress one zero block with counter=0, final
+                    compress initState 0 0 0 0 True zeroMessageBlock
 
-            else
-                case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) paddedData of
-                    Just hs ->
-                        hs
+                _ ->
+                    case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) paddedData of
+                        Just hs ->
+                            hs
 
-                    Nothing ->
-                        initState
+                        Nothing ->
+                            initState
     in
     encodeDigest config.digestLength finalState
 
