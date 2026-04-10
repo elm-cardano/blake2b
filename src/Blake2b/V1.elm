@@ -2,6 +2,22 @@ module Blake2b.V1 exposing (hash, hash224, hash256, hash512)
 
 {-| Pure Elm BLAKE2b implementation (RFC 7693) optimized for V8 performance.
 
+Changes in V6 (from V5):
+
+  - Pre-pads input to a 128-byte boundary before entering the decode loop,
+    so the loop always reads full blocks with blockDecoder. Eliminates the
+    partial-block path that did padBlock (O(n) List.repeat) + Decode.decode
+    (full re-decode). Uses u32-sized zero padding where possible (4x fewer
+    list cons cells). ~9% faster on inputs with partial last blocks.
+  - Hoists zero MessageBlock to module level for the empty-input path.
+
+Changes in V5 (from V4):
+
+  - Restructures blockDecoder into quarter-block sub-decoders (8 args each)
+    to stay within Elm's F2..F9 fast path. Previous chained helpers had up
+    to 28 arguments, creating ~55 curried closures per block decode.
+  - Changes encodeDigest from 17 args to 2 (record-based). ~14% faster.
+
 Changes in V4 (from V3):
 
   - Flattens all state types to raw hi/lo Int fields. WorkingVector goes from
@@ -30,7 +46,7 @@ Base (V1):
 
 import Bitwise
 import Blake2b.Internal.Constants exposing (..)
-import Blake2b.Internal.DecodeV2 exposing (MessageBlock, blockDecoder, encodeDigest, padBlock)
+import Blake2b.Internal.Decode exposing (MessageBlock, blockDecoder, encodeDigest)
 import Bytes exposing (Bytes, Endianness(..))
 import Bytes.Decode as Decode
 import Bytes.Encode as Encode
@@ -1806,7 +1822,7 @@ type alias LoopAcc =
 blockLoop : LoopAcc -> Decode.Decoder (Decode.Step LoopAcc HashState)
 blockLoop acc =
     if acc.remaining > 128 then
-        -- Full block, not the last
+        -- Not the last block
         Decode.map
             (\mb ->
                 let
@@ -1815,12 +1831,9 @@ blockLoop acc =
 
                     newT0Hi =
                         acc.t0Hi + counterCarry acc.t0Lo newT0Lo
-
-                    newH =
-                        compress acc.h newT0Hi newT0Lo 0 0 False mb
                 in
                 Decode.Loop
-                    { h = newH
+                    { h = compress acc.h newT0Hi newT0Lo 0 0 False mb
                     , t0Lo = newT0Lo
                     , t0Hi = newT0Hi
                     , remaining = acc.remaining - 128
@@ -1828,13 +1841,13 @@ blockLoop acc =
             )
             blockDecoder
 
-    else if acc.remaining == 128 then
-        -- Last block, exactly full
+    else
+        -- Last block (input was pre-padded to 128-byte boundary)
         Decode.map
             (\mb ->
                 let
                     newT0Lo =
-                        Bitwise.shiftRightZfBy 0 (acc.t0Lo + 128)
+                        Bitwise.shiftRightZfBy 0 (acc.t0Lo + acc.remaining)
 
                     newT0Hi =
                         acc.t0Hi + counterCarry acc.t0Lo newT0Lo
@@ -1842,32 +1855,6 @@ blockLoop acc =
                 Decode.Done (compress acc.h newT0Hi newT0Lo 0 0 True mb)
             )
             blockDecoder
-
-    else
-        -- Last block, partial (1 to 127 bytes)
-        Decode.map
-            (\partialBytes ->
-                let
-                    lastSize =
-                        acc.remaining
-
-                    newT0Lo =
-                        Bitwise.shiftRightZfBy 0 (acc.t0Lo + lastSize)
-
-                    newT0Hi =
-                        acc.t0Hi + counterCarry acc.t0Lo newT0Lo
-
-                    padded =
-                        padBlock partialBytes
-                in
-                case Decode.decode blockDecoder padded of
-                    Just mb ->
-                        Decode.Done (compress acc.h newT0Hi newT0Lo 0 0 True mb)
-
-                    Nothing ->
-                        Decode.Done acc.h
-            )
-            (Decode.bytes acc.remaining)
 
 
 
@@ -1877,6 +1864,22 @@ blockLoop acc =
 emptyBytes : Bytes
 emptyBytes =
     Encode.encode (Encode.sequence [])
+
+
+{-| Pre-decoded zero block (128 zero bytes), hoisted to module level.
+Used for empty unkeyed input where we compress a single zero block.
+-}
+zeroMessageBlock : MessageBlock
+zeroMessageBlock =
+    { m0Hi = 0, m0Lo = 0, m1Hi = 0, m1Lo = 0
+    , m2Hi = 0, m2Lo = 0, m3Hi = 0, m3Lo = 0
+    , m4Hi = 0, m4Lo = 0, m5Hi = 0, m5Lo = 0
+    , m6Hi = 0, m6Lo = 0, m7Hi = 0, m7Lo = 0
+    , m8Hi = 0, m8Lo = 0, m9Hi = 0, m9Lo = 0
+    , m10Hi = 0, m10Lo = 0, m11Hi = 0, m11Lo = 0
+    , m12Hi = 0, m12Lo = 0, m13Hi = 0, m13Lo = 0
+    , m14Hi = 0, m14Lo = 0, m15Hi = 0, m15Lo = 0
+    }
 
 
 {-| Compute a BLAKE2b hash with the given digest length, key, and data.
@@ -1939,22 +1942,43 @@ hash config =
             , h7Lo = iv7Lo
             }
 
+        -- Pre-pad input to a multiple of 128 bytes so the loop always
+        -- reads full blocks. Avoids the pad+re-decode round-trip for
+        -- partial last blocks.
+        paddedData =
+            let
+                remainder =
+                    remainderBy 128 totalLen
+            in
+            if totalLen == 0 || remainder == 0 then
+                fullData
+
+            else
+                let
+                    padNeeded =
+                        128 - remainder
+
+                    zeroU32s =
+                        padNeeded // 4
+
+                    tailU8s =
+                        remainderBy 4 padNeeded
+                in
+                Encode.encode
+                    (Encode.sequence
+                        [ Encode.bytes fullData
+                        , Encode.sequence (List.repeat zeroU32s (Encode.unsignedInt32 LE 0))
+                        , Encode.sequence (List.repeat tailU8s (Encode.unsignedInt8 0))
+                        ]
+                    )
+
         finalState =
             if totalLen == 0 then
                 -- Empty unkeyed: compress one zero block with counter=0, final
-                let
-                    zeroBytes =
-                        Encode.encode (Encode.sequence (List.repeat 128 (Encode.unsignedInt8 0)))
-                in
-                case Decode.decode blockDecoder zeroBytes of
-                    Just mb ->
-                        compress initState 0 0 0 0 True mb
-
-                    Nothing ->
-                        initState
+                compress initState 0 0 0 0 True zeroMessageBlock
 
             else
-                case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) fullData of
+                case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) paddedData of
                     Just hs ->
                         hs
 
