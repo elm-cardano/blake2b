@@ -56,7 +56,8 @@ keyed =
 All intermediate values in the compression function are `let` bindings on raw `Int` pairs, which compile to plain JS variables with zero allocation.
 This keeps garbage collection pressure low and makes the implementation practical for real use.
 
-For details on the optimization journey, see [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
+For details on the optimization journey, see [docs/IMPLEMENTATION.md](https://github.com/elm-cardano/blake2b/blob/main/docs/IMPLEMENTATION.md).
+Benchmarking infrastructure lives in the [bench/](https://github.com/elm-cardano/blake2b/tree/main/bench) folder.
 
 ## Correctness
 
