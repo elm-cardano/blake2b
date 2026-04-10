@@ -2,15 +2,18 @@ module Blake2b.V2 exposing (hash, hash224, hash256, hash512)
 
 {-| Pure Elm BLAKE2b implementation (RFC 7693) optimized for V8 performance.
 
-Changes in V2 (later renamed as the new V1):
+Changes in V2:
 
-  - Bitwise carry detection in add64: replaces `lo < (a.lo >>> 0)` comparison
-    (which compiles to Elm's polymorphic `_Utils_cmp` with a `typeof` type guard)
-    with a pure bitwise formula: `((aLo AND bLo) OR ((aLo OR bLo) AND (NOT sumLo))) >>> 31`.
-    This eliminates ~768 `_Utils_cmp` calls per block (8 adds/G × 8 G calls × 12 rounds).
+  - Inlines the G mixing function directly into each round function as raw
+    hi/lo Int let-bindings. This eliminates ~2000 intermediate U64 record
+    allocations per block (each G call previously created ~21 U64 records
+    for add64/xor64/rotr results, 8 calls × 12 rounds = ~2016 records).
+    Now all intermediates are JS `var` statements with zero allocation.
+    Only the output WorkingVector (16 U64 records) is allocated per round.
 
 Base:
 
+  - Bitwise carry detection in add64 (avoids polymorphic _Utils_cmp)
   - Hoists IV U64 constructions to module level (evaluated once at load time)
   - Uses 10 specialized 2-arg round functions instead of one 17-arg generic round
   - Constructs a U64MessageBlock once per compress call, shared across all 12 rounds
@@ -34,63 +37,12 @@ type alias U64 =
 
 
 
--- PRIMITIVE OPERATIONS
-
-
-add64 : U64 -> U64 -> U64
-add64 a b =
-    let
-        lo =
-            Bitwise.shiftRightZfBy 0 (a.lo + b.lo)
-
-        -- Bitwise carry detection: avoids Elm's polymorphic _Utils_cmp.
-        -- Overflow occurred iff the sum lost a bit that at least one operand had.
-        -- The MSB of ((aLo AND bLo) OR ((aLo OR bLo) AND NOT sumLo)) is 1 iff carry.
-        carry =
-            Bitwise.shiftRightZfBy 31
-                (Bitwise.or
-                    (Bitwise.and a.lo b.lo)
-                    (Bitwise.and
-                        (Bitwise.or a.lo b.lo)
-                        (Bitwise.complement lo)
-                    )
-                )
-
-        hi =
-            Bitwise.shiftRightZfBy 0 (a.hi + b.hi + carry)
-    in
-    { hi = hi, lo = lo }
+-- PRIMITIVE OPERATIONS (xor64 used in compress finalization)
 
 
 xor64 : U64 -> U64 -> U64
 xor64 a b =
     { hi = Bitwise.xor a.hi b.hi, lo = Bitwise.xor a.lo b.lo }
-
-
-rotr32 : U64 -> U64
-rotr32 w =
-    { hi = w.lo, lo = w.hi }
-
-
-rotr24 : U64 -> U64
-rotr24 w =
-    { hi = Bitwise.or (Bitwise.shiftRightZfBy 24 w.hi) (Bitwise.shiftLeftBy 8 w.lo)
-    , lo = Bitwise.or (Bitwise.shiftRightZfBy 24 w.lo) (Bitwise.shiftLeftBy 8 w.hi)
-    }
-
-
-rotr16 : U64 -> U64
-rotr16 w =
-    { hi = Bitwise.or (Bitwise.shiftRightZfBy 16 w.hi) (Bitwise.shiftLeftBy 16 w.lo)
-    , lo = Bitwise.or (Bitwise.shiftRightZfBy 16 w.lo) (Bitwise.shiftLeftBy 16 w.hi)
-    }
-
-
-rotr63 : U64 -> U64
-rotr63 w =
-    { hi = Bitwise.or (Bitwise.shiftLeftBy 1 w.hi) (Bitwise.shiftRightZfBy 31 w.lo)
-    , lo = Bitwise.or (Bitwise.shiftLeftBy 1 w.lo) (Bitwise.shiftRightZfBy 31 w.hi)
-    }
 
 
 {-| Detect carry from adding a known increment to a 32-bit counter.
@@ -101,40 +53,6 @@ counterCarry : Int -> Int -> Int
 counterCarry old new =
     Bitwise.shiftRightZfBy 31
         (Bitwise.and old (Bitwise.complement new))
-
-
-
--- G MIXING FUNCTION
-
-
-g : U64 -> U64 -> U64 -> U64 -> U64 -> U64 -> { a : U64, b : U64, c : U64, d : U64 }
-g a b c d x y =
-    let
-        a1 =
-            add64 (add64 a b) x
-
-        d1 =
-            rotr32 (xor64 d a1)
-
-        c1 =
-            add64 c d1
-
-        b1 =
-            rotr24 (xor64 b c1)
-
-        a2 =
-            add64 (add64 a1 b1) y
-
-        d2 =
-            rotr16 (xor64 d1 a2)
-
-        c2 =
-            add64 c1 d2
-
-        b2 =
-            rotr63 (xor64 b1 c2)
-    in
-    { a = a2, b = b2, c = c2, d = d2 }
 
 
 
@@ -241,7 +159,8 @@ iv7U =
 -- ROUND FUNCTIONS
 -- 10 specialized functions (rounds 10/11 reuse round0/round1).
 -- Each takes only 2 args (U64MessageBlock + WorkingVector), well within
--- Elm's 9-argument fast path. Sigma permutations are hardcoded per round.
+-- Elm's 9-argument fast path. G mixing is fully inlined as hi/lo let bindings.
+
 
 
 {-| SIGMA[0] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }
@@ -249,46 +168,1199 @@ iv7U =
 round0 : U64MessageBlock -> WorkingVector -> WorkingVector
 round0 mb v =
     let
-        g0 =
-            g v.v0 v.v4 v.v8 v.v12 mb.m0 mb.m1
+        -- Column G0: a=v0, b=v4, c=v8, d=v12, x=m0, y=m1
+        -- a1 = add64(add64(a, b), x)
+        g0_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v0.lo + v.v4.lo)
 
-        g1 =
-            g v.v1 v.v5 v.v9 v.v13 mb.m2 mb.m3
+        g0_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v0.lo v.v4.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v0.lo v.v4.lo)
+                        (Bitwise.complement g0_abLo)
+                    )
+                )
 
-        g2 =
-            g v.v2 v.v6 v.v10 v.v14 mb.m4 mb.m5
+        g0_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v0.hi + v.v4.hi + g0_abCarry)
 
-        g3 =
-            g v.v3 v.v7 v.v11 v.v15 mb.m6 mb.m7
+        g0_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_abLo + mb.m0.lo)
 
-        g4 =
-            g g0.a g1.b g2.c g3.d mb.m8 mb.m9
+        g0_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_abLo mb.m0.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_abLo mb.m0.lo)
+                        (Bitwise.complement g0_a1Lo)
+                    )
+                )
 
-        g5 =
-            g g1.a g2.b g3.c g0.d mb.m10 mb.m11
+        g0_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_abHi + mb.m0.hi + g0_a1Carry)
 
-        g6 =
-            g g2.a g3.b g0.c g1.d mb.m12 mb.m13
+        -- d1 = rotr32(xor64(d, a1))
+        g0_d1Hi =
+            Bitwise.xor v.v12.lo g0_a1Lo
 
-        g7 =
-            g g3.a g0.b g1.c g2.d mb.m14 mb.m15
+        g0_d1Lo =
+            Bitwise.xor v.v12.hi g0_a1Hi
+
+        -- c1 = add64(c, d1)
+        g0_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v8.lo + g0_d1Lo)
+
+        g0_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v8.lo g0_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v8.lo g0_d1Lo)
+                        (Bitwise.complement g0_c1Lo)
+                    )
+                )
+
+        g0_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v8.hi + g0_d1Hi + g0_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g0_b1xHi =
+            Bitwise.xor v.v4.hi g0_c1Hi
+
+        g0_b1xLo =
+            Bitwise.xor v.v4.lo g0_c1Lo
+
+        g0_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xHi) (Bitwise.shiftLeftBy 8 g0_b1xLo)
+
+        g0_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xLo) (Bitwise.shiftLeftBy 8 g0_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g0_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1Lo + g0_b1Lo)
+
+        g0_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1Lo g0_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1Lo g0_b1Lo)
+                        (Bitwise.complement g0_a1b1Lo)
+                    )
+                )
+
+        g0_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1Hi + g0_b1Hi + g0_a1b1Carry)
+
+        g0_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Lo + mb.m1.lo)
+
+        g0_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1b1Lo mb.m1.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1b1Lo mb.m1.lo)
+                        (Bitwise.complement g0_a2Lo)
+                    )
+                )
+
+        g0_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Hi + mb.m1.hi + g0_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g0_d2xHi =
+            Bitwise.xor g0_d1Hi g0_a2Hi
+
+        g0_d2xLo =
+            Bitwise.xor g0_d1Lo g0_a2Lo
+
+        g0_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xHi) (Bitwise.shiftLeftBy 16 g0_d2xLo)
+
+        g0_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xLo) (Bitwise.shiftLeftBy 16 g0_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g0_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c1Lo + g0_d2Lo)
+
+        g0_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c1Lo g0_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c1Lo g0_d2Lo)
+                        (Bitwise.complement g0_c2Lo)
+                    )
+                )
+
+        g0_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c1Hi + g0_d2Hi + g0_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g0_b2xHi =
+            Bitwise.xor g0_b1Hi g0_c2Hi
+
+        g0_b2xLo =
+            Bitwise.xor g0_b1Lo g0_c2Lo
+
+        g0_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xHi) (Bitwise.shiftRightZfBy 31 g0_b2xLo)
+
+        g0_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xLo) (Bitwise.shiftRightZfBy 31 g0_b2xHi)
+
+        -- Column G1: a=v1, b=v5, c=v9, d=v13, x=m2, y=m3
+        -- a1 = add64(add64(a, b), x)
+        g1_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v1.lo + v.v5.lo)
+
+        g1_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v1.lo v.v5.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v1.lo v.v5.lo)
+                        (Bitwise.complement g1_abLo)
+                    )
+                )
+
+        g1_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v1.hi + v.v5.hi + g1_abCarry)
+
+        g1_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_abLo + mb.m2.lo)
+
+        g1_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_abLo mb.m2.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_abLo mb.m2.lo)
+                        (Bitwise.complement g1_a1Lo)
+                    )
+                )
+
+        g1_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_abHi + mb.m2.hi + g1_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g1_d1Hi =
+            Bitwise.xor v.v13.lo g1_a1Lo
+
+        g1_d1Lo =
+            Bitwise.xor v.v13.hi g1_a1Hi
+
+        -- c1 = add64(c, d1)
+        g1_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v9.lo + g1_d1Lo)
+
+        g1_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v9.lo g1_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v9.lo g1_d1Lo)
+                        (Bitwise.complement g1_c1Lo)
+                    )
+                )
+
+        g1_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v9.hi + g1_d1Hi + g1_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g1_b1xHi =
+            Bitwise.xor v.v5.hi g1_c1Hi
+
+        g1_b1xLo =
+            Bitwise.xor v.v5.lo g1_c1Lo
+
+        g1_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xHi) (Bitwise.shiftLeftBy 8 g1_b1xLo)
+
+        g1_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xLo) (Bitwise.shiftLeftBy 8 g1_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g1_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1Lo + g1_b1Lo)
+
+        g1_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1Lo g1_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1Lo g1_b1Lo)
+                        (Bitwise.complement g1_a1b1Lo)
+                    )
+                )
+
+        g1_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1Hi + g1_b1Hi + g1_a1b1Carry)
+
+        g1_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Lo + mb.m3.lo)
+
+        g1_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1b1Lo mb.m3.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1b1Lo mb.m3.lo)
+                        (Bitwise.complement g1_a2Lo)
+                    )
+                )
+
+        g1_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Hi + mb.m3.hi + g1_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g1_d2xHi =
+            Bitwise.xor g1_d1Hi g1_a2Hi
+
+        g1_d2xLo =
+            Bitwise.xor g1_d1Lo g1_a2Lo
+
+        g1_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xHi) (Bitwise.shiftLeftBy 16 g1_d2xLo)
+
+        g1_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xLo) (Bitwise.shiftLeftBy 16 g1_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g1_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c1Lo + g1_d2Lo)
+
+        g1_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c1Lo g1_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c1Lo g1_d2Lo)
+                        (Bitwise.complement g1_c2Lo)
+                    )
+                )
+
+        g1_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c1Hi + g1_d2Hi + g1_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g1_b2xHi =
+            Bitwise.xor g1_b1Hi g1_c2Hi
+
+        g1_b2xLo =
+            Bitwise.xor g1_b1Lo g1_c2Lo
+
+        g1_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xHi) (Bitwise.shiftRightZfBy 31 g1_b2xLo)
+
+        g1_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xLo) (Bitwise.shiftRightZfBy 31 g1_b2xHi)
+
+        -- Column G2: a=v2, b=v6, c=v10, d=v14, x=m4, y=m5
+        -- a1 = add64(add64(a, b), x)
+        g2_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v2.lo + v.v6.lo)
+
+        g2_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v2.lo v.v6.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v2.lo v.v6.lo)
+                        (Bitwise.complement g2_abLo)
+                    )
+                )
+
+        g2_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v2.hi + v.v6.hi + g2_abCarry)
+
+        g2_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_abLo + mb.m4.lo)
+
+        g2_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_abLo mb.m4.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_abLo mb.m4.lo)
+                        (Bitwise.complement g2_a1Lo)
+                    )
+                )
+
+        g2_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_abHi + mb.m4.hi + g2_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g2_d1Hi =
+            Bitwise.xor v.v14.lo g2_a1Lo
+
+        g2_d1Lo =
+            Bitwise.xor v.v14.hi g2_a1Hi
+
+        -- c1 = add64(c, d1)
+        g2_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v10.lo + g2_d1Lo)
+
+        g2_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v10.lo g2_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v10.lo g2_d1Lo)
+                        (Bitwise.complement g2_c1Lo)
+                    )
+                )
+
+        g2_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v10.hi + g2_d1Hi + g2_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g2_b1xHi =
+            Bitwise.xor v.v6.hi g2_c1Hi
+
+        g2_b1xLo =
+            Bitwise.xor v.v6.lo g2_c1Lo
+
+        g2_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xHi) (Bitwise.shiftLeftBy 8 g2_b1xLo)
+
+        g2_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xLo) (Bitwise.shiftLeftBy 8 g2_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g2_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1Lo + g2_b1Lo)
+
+        g2_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1Lo g2_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1Lo g2_b1Lo)
+                        (Bitwise.complement g2_a1b1Lo)
+                    )
+                )
+
+        g2_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1Hi + g2_b1Hi + g2_a1b1Carry)
+
+        g2_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Lo + mb.m5.lo)
+
+        g2_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1b1Lo mb.m5.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1b1Lo mb.m5.lo)
+                        (Bitwise.complement g2_a2Lo)
+                    )
+                )
+
+        g2_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Hi + mb.m5.hi + g2_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g2_d2xHi =
+            Bitwise.xor g2_d1Hi g2_a2Hi
+
+        g2_d2xLo =
+            Bitwise.xor g2_d1Lo g2_a2Lo
+
+        g2_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xHi) (Bitwise.shiftLeftBy 16 g2_d2xLo)
+
+        g2_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xLo) (Bitwise.shiftLeftBy 16 g2_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g2_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c1Lo + g2_d2Lo)
+
+        g2_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c1Lo g2_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c1Lo g2_d2Lo)
+                        (Bitwise.complement g2_c2Lo)
+                    )
+                )
+
+        g2_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c1Hi + g2_d2Hi + g2_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g2_b2xHi =
+            Bitwise.xor g2_b1Hi g2_c2Hi
+
+        g2_b2xLo =
+            Bitwise.xor g2_b1Lo g2_c2Lo
+
+        g2_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xHi) (Bitwise.shiftRightZfBy 31 g2_b2xLo)
+
+        g2_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xLo) (Bitwise.shiftRightZfBy 31 g2_b2xHi)
+
+        -- Column G3: a=v3, b=v7, c=v11, d=v15, x=m6, y=m7
+        -- a1 = add64(add64(a, b), x)
+        g3_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v3.lo + v.v7.lo)
+
+        g3_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v3.lo v.v7.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v3.lo v.v7.lo)
+                        (Bitwise.complement g3_abLo)
+                    )
+                )
+
+        g3_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v3.hi + v.v7.hi + g3_abCarry)
+
+        g3_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_abLo + mb.m6.lo)
+
+        g3_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_abLo mb.m6.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_abLo mb.m6.lo)
+                        (Bitwise.complement g3_a1Lo)
+                    )
+                )
+
+        g3_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_abHi + mb.m6.hi + g3_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g3_d1Hi =
+            Bitwise.xor v.v15.lo g3_a1Lo
+
+        g3_d1Lo =
+            Bitwise.xor v.v15.hi g3_a1Hi
+
+        -- c1 = add64(c, d1)
+        g3_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v11.lo + g3_d1Lo)
+
+        g3_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v11.lo g3_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v11.lo g3_d1Lo)
+                        (Bitwise.complement g3_c1Lo)
+                    )
+                )
+
+        g3_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v11.hi + g3_d1Hi + g3_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g3_b1xHi =
+            Bitwise.xor v.v7.hi g3_c1Hi
+
+        g3_b1xLo =
+            Bitwise.xor v.v7.lo g3_c1Lo
+
+        g3_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xHi) (Bitwise.shiftLeftBy 8 g3_b1xLo)
+
+        g3_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xLo) (Bitwise.shiftLeftBy 8 g3_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g3_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1Lo + g3_b1Lo)
+
+        g3_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1Lo g3_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1Lo g3_b1Lo)
+                        (Bitwise.complement g3_a1b1Lo)
+                    )
+                )
+
+        g3_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1Hi + g3_b1Hi + g3_a1b1Carry)
+
+        g3_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Lo + mb.m7.lo)
+
+        g3_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1b1Lo mb.m7.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1b1Lo mb.m7.lo)
+                        (Bitwise.complement g3_a2Lo)
+                    )
+                )
+
+        g3_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Hi + mb.m7.hi + g3_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g3_d2xHi =
+            Bitwise.xor g3_d1Hi g3_a2Hi
+
+        g3_d2xLo =
+            Bitwise.xor g3_d1Lo g3_a2Lo
+
+        g3_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xHi) (Bitwise.shiftLeftBy 16 g3_d2xLo)
+
+        g3_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xLo) (Bitwise.shiftLeftBy 16 g3_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g3_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c1Lo + g3_d2Lo)
+
+        g3_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c1Lo g3_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c1Lo g3_d2Lo)
+                        (Bitwise.complement g3_c2Lo)
+                    )
+                )
+
+        g3_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c1Hi + g3_d2Hi + g3_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g3_b2xHi =
+            Bitwise.xor g3_b1Hi g3_c2Hi
+
+        g3_b2xLo =
+            Bitwise.xor g3_b1Lo g3_c2Lo
+
+        g3_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xHi) (Bitwise.shiftRightZfBy 31 g3_b2xLo)
+
+        g3_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xLo) (Bitwise.shiftRightZfBy 31 g3_b2xHi)
+
+        -- Diagonal G4: a=g0.a, b=g1.b, c=g2.c, d=g3.d, x=m8, y=m9
+        -- a1 = add64(add64(a, b), x)
+        g4_abLo =
+            Bitwise.shiftRightZfBy 0 (g0_a2Lo + g1_b2Lo)
+
+        g4_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a2Lo g1_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a2Lo g1_b2Lo)
+                        (Bitwise.complement g4_abLo)
+                    )
+                )
+
+        g4_abHi =
+            Bitwise.shiftRightZfBy 0 (g0_a2Hi + g1_b2Hi + g4_abCarry)
+
+        g4_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_abLo + mb.m8.lo)
+
+        g4_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_abLo mb.m8.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_abLo mb.m8.lo)
+                        (Bitwise.complement g4_a1Lo)
+                    )
+                )
+
+        g4_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_abHi + mb.m8.hi + g4_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g4_d1Hi =
+            Bitwise.xor g3_d2Lo g4_a1Lo
+
+        g4_d1Lo =
+            Bitwise.xor g3_d2Hi g4_a1Hi
+
+        -- c1 = add64(c, d1)
+        g4_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c2Lo + g4_d1Lo)
+
+        g4_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c2Lo g4_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c2Lo g4_d1Lo)
+                        (Bitwise.complement g4_c1Lo)
+                    )
+                )
+
+        g4_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c2Hi + g4_d1Hi + g4_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g4_b1xHi =
+            Bitwise.xor g1_b2Hi g4_c1Hi
+
+        g4_b1xLo =
+            Bitwise.xor g1_b2Lo g4_c1Lo
+
+        g4_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xHi) (Bitwise.shiftLeftBy 8 g4_b1xLo)
+
+        g4_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xLo) (Bitwise.shiftLeftBy 8 g4_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g4_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1Lo + g4_b1Lo)
+
+        g4_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1Lo g4_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1Lo g4_b1Lo)
+                        (Bitwise.complement g4_a1b1Lo)
+                    )
+                )
+
+        g4_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1Hi + g4_b1Hi + g4_a1b1Carry)
+
+        g4_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Lo + mb.m9.lo)
+
+        g4_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1b1Lo mb.m9.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1b1Lo mb.m9.lo)
+                        (Bitwise.complement g4_a2Lo)
+                    )
+                )
+
+        g4_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Hi + mb.m9.hi + g4_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g4_d2xHi =
+            Bitwise.xor g4_d1Hi g4_a2Hi
+
+        g4_d2xLo =
+            Bitwise.xor g4_d1Lo g4_a2Lo
+
+        g4_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xHi) (Bitwise.shiftLeftBy 16 g4_d2xLo)
+
+        g4_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xLo) (Bitwise.shiftLeftBy 16 g4_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g4_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_c1Lo + g4_d2Lo)
+
+        g4_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_c1Lo g4_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_c1Lo g4_d2Lo)
+                        (Bitwise.complement g4_c2Lo)
+                    )
+                )
+
+        g4_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_c1Hi + g4_d2Hi + g4_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g4_b2xHi =
+            Bitwise.xor g4_b1Hi g4_c2Hi
+
+        g4_b2xLo =
+            Bitwise.xor g4_b1Lo g4_c2Lo
+
+        g4_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xHi) (Bitwise.shiftRightZfBy 31 g4_b2xLo)
+
+        g4_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xLo) (Bitwise.shiftRightZfBy 31 g4_b2xHi)
+
+        -- Diagonal G5: a=g1.a, b=g2.b, c=g3.c, d=g0.d, x=m10, y=m11
+        -- a1 = add64(add64(a, b), x)
+        g5_abLo =
+            Bitwise.shiftRightZfBy 0 (g1_a2Lo + g2_b2Lo)
+
+        g5_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a2Lo g2_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a2Lo g2_b2Lo)
+                        (Bitwise.complement g5_abLo)
+                    )
+                )
+
+        g5_abHi =
+            Bitwise.shiftRightZfBy 0 (g1_a2Hi + g2_b2Hi + g5_abCarry)
+
+        g5_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_abLo + mb.m10.lo)
+
+        g5_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_abLo mb.m10.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_abLo mb.m10.lo)
+                        (Bitwise.complement g5_a1Lo)
+                    )
+                )
+
+        g5_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_abHi + mb.m10.hi + g5_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g5_d1Hi =
+            Bitwise.xor g0_d2Lo g5_a1Lo
+
+        g5_d1Lo =
+            Bitwise.xor g0_d2Hi g5_a1Hi
+
+        -- c1 = add64(c, d1)
+        g5_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c2Lo + g5_d1Lo)
+
+        g5_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c2Lo g5_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c2Lo g5_d1Lo)
+                        (Bitwise.complement g5_c1Lo)
+                    )
+                )
+
+        g5_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c2Hi + g5_d1Hi + g5_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g5_b1xHi =
+            Bitwise.xor g2_b2Hi g5_c1Hi
+
+        g5_b1xLo =
+            Bitwise.xor g2_b2Lo g5_c1Lo
+
+        g5_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xHi) (Bitwise.shiftLeftBy 8 g5_b1xLo)
+
+        g5_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xLo) (Bitwise.shiftLeftBy 8 g5_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g5_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1Lo + g5_b1Lo)
+
+        g5_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1Lo g5_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1Lo g5_b1Lo)
+                        (Bitwise.complement g5_a1b1Lo)
+                    )
+                )
+
+        g5_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1Hi + g5_b1Hi + g5_a1b1Carry)
+
+        g5_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Lo + mb.m11.lo)
+
+        g5_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1b1Lo mb.m11.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1b1Lo mb.m11.lo)
+                        (Bitwise.complement g5_a2Lo)
+                    )
+                )
+
+        g5_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Hi + mb.m11.hi + g5_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g5_d2xHi =
+            Bitwise.xor g5_d1Hi g5_a2Hi
+
+        g5_d2xLo =
+            Bitwise.xor g5_d1Lo g5_a2Lo
+
+        g5_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xHi) (Bitwise.shiftLeftBy 16 g5_d2xLo)
+
+        g5_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xLo) (Bitwise.shiftLeftBy 16 g5_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g5_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_c1Lo + g5_d2Lo)
+
+        g5_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_c1Lo g5_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_c1Lo g5_d2Lo)
+                        (Bitwise.complement g5_c2Lo)
+                    )
+                )
+
+        g5_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_c1Hi + g5_d2Hi + g5_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g5_b2xHi =
+            Bitwise.xor g5_b1Hi g5_c2Hi
+
+        g5_b2xLo =
+            Bitwise.xor g5_b1Lo g5_c2Lo
+
+        g5_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xHi) (Bitwise.shiftRightZfBy 31 g5_b2xLo)
+
+        g5_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xLo) (Bitwise.shiftRightZfBy 31 g5_b2xHi)
+
+        -- Diagonal G6: a=g2.a, b=g3.b, c=g0.c, d=g1.d, x=m12, y=m13
+        -- a1 = add64(add64(a, b), x)
+        g6_abLo =
+            Bitwise.shiftRightZfBy 0 (g2_a2Lo + g3_b2Lo)
+
+        g6_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a2Lo g3_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a2Lo g3_b2Lo)
+                        (Bitwise.complement g6_abLo)
+                    )
+                )
+
+        g6_abHi =
+            Bitwise.shiftRightZfBy 0 (g2_a2Hi + g3_b2Hi + g6_abCarry)
+
+        g6_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_abLo + mb.m12.lo)
+
+        g6_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_abLo mb.m12.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_abLo mb.m12.lo)
+                        (Bitwise.complement g6_a1Lo)
+                    )
+                )
+
+        g6_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_abHi + mb.m12.hi + g6_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g6_d1Hi =
+            Bitwise.xor g1_d2Lo g6_a1Lo
+
+        g6_d1Lo =
+            Bitwise.xor g1_d2Hi g6_a1Hi
+
+        -- c1 = add64(c, d1)
+        g6_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c2Lo + g6_d1Lo)
+
+        g6_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c2Lo g6_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c2Lo g6_d1Lo)
+                        (Bitwise.complement g6_c1Lo)
+                    )
+                )
+
+        g6_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c2Hi + g6_d1Hi + g6_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g6_b1xHi =
+            Bitwise.xor g3_b2Hi g6_c1Hi
+
+        g6_b1xLo =
+            Bitwise.xor g3_b2Lo g6_c1Lo
+
+        g6_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xHi) (Bitwise.shiftLeftBy 8 g6_b1xLo)
+
+        g6_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xLo) (Bitwise.shiftLeftBy 8 g6_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g6_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1Lo + g6_b1Lo)
+
+        g6_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1Lo g6_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1Lo g6_b1Lo)
+                        (Bitwise.complement g6_a1b1Lo)
+                    )
+                )
+
+        g6_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1Hi + g6_b1Hi + g6_a1b1Carry)
+
+        g6_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Lo + mb.m13.lo)
+
+        g6_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1b1Lo mb.m13.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1b1Lo mb.m13.lo)
+                        (Bitwise.complement g6_a2Lo)
+                    )
+                )
+
+        g6_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Hi + mb.m13.hi + g6_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g6_d2xHi =
+            Bitwise.xor g6_d1Hi g6_a2Hi
+
+        g6_d2xLo =
+            Bitwise.xor g6_d1Lo g6_a2Lo
+
+        g6_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xHi) (Bitwise.shiftLeftBy 16 g6_d2xLo)
+
+        g6_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xLo) (Bitwise.shiftLeftBy 16 g6_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g6_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_c1Lo + g6_d2Lo)
+
+        g6_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_c1Lo g6_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_c1Lo g6_d2Lo)
+                        (Bitwise.complement g6_c2Lo)
+                    )
+                )
+
+        g6_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_c1Hi + g6_d2Hi + g6_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g6_b2xHi =
+            Bitwise.xor g6_b1Hi g6_c2Hi
+
+        g6_b2xLo =
+            Bitwise.xor g6_b1Lo g6_c2Lo
+
+        g6_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xHi) (Bitwise.shiftRightZfBy 31 g6_b2xLo)
+
+        g6_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xLo) (Bitwise.shiftRightZfBy 31 g6_b2xHi)
+
+        -- Diagonal G7: a=g3.a, b=g0.b, c=g1.c, d=g2.d, x=m14, y=m15
+        -- a1 = add64(add64(a, b), x)
+        g7_abLo =
+            Bitwise.shiftRightZfBy 0 (g3_a2Lo + g0_b2Lo)
+
+        g7_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a2Lo g0_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a2Lo g0_b2Lo)
+                        (Bitwise.complement g7_abLo)
+                    )
+                )
+
+        g7_abHi =
+            Bitwise.shiftRightZfBy 0 (g3_a2Hi + g0_b2Hi + g7_abCarry)
+
+        g7_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_abLo + mb.m14.lo)
+
+        g7_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_abLo mb.m14.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_abLo mb.m14.lo)
+                        (Bitwise.complement g7_a1Lo)
+                    )
+                )
+
+        g7_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_abHi + mb.m14.hi + g7_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g7_d1Hi =
+            Bitwise.xor g2_d2Lo g7_a1Lo
+
+        g7_d1Lo =
+            Bitwise.xor g2_d2Hi g7_a1Hi
+
+        -- c1 = add64(c, d1)
+        g7_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c2Lo + g7_d1Lo)
+
+        g7_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c2Lo g7_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c2Lo g7_d1Lo)
+                        (Bitwise.complement g7_c1Lo)
+                    )
+                )
+
+        g7_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c2Hi + g7_d1Hi + g7_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g7_b1xHi =
+            Bitwise.xor g0_b2Hi g7_c1Hi
+
+        g7_b1xLo =
+            Bitwise.xor g0_b2Lo g7_c1Lo
+
+        g7_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xHi) (Bitwise.shiftLeftBy 8 g7_b1xLo)
+
+        g7_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xLo) (Bitwise.shiftLeftBy 8 g7_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g7_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1Lo + g7_b1Lo)
+
+        g7_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1Lo g7_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1Lo g7_b1Lo)
+                        (Bitwise.complement g7_a1b1Lo)
+                    )
+                )
+
+        g7_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1Hi + g7_b1Hi + g7_a1b1Carry)
+
+        g7_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Lo + mb.m15.lo)
+
+        g7_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1b1Lo mb.m15.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1b1Lo mb.m15.lo)
+                        (Bitwise.complement g7_a2Lo)
+                    )
+                )
+
+        g7_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Hi + mb.m15.hi + g7_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g7_d2xHi =
+            Bitwise.xor g7_d1Hi g7_a2Hi
+
+        g7_d2xLo =
+            Bitwise.xor g7_d1Lo g7_a2Lo
+
+        g7_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xHi) (Bitwise.shiftLeftBy 16 g7_d2xLo)
+
+        g7_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xLo) (Bitwise.shiftLeftBy 16 g7_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g7_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_c1Lo + g7_d2Lo)
+
+        g7_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_c1Lo g7_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_c1Lo g7_d2Lo)
+                        (Bitwise.complement g7_c2Lo)
+                    )
+                )
+
+        g7_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_c1Hi + g7_d2Hi + g7_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g7_b2xHi =
+            Bitwise.xor g7_b1Hi g7_c2Hi
+
+        g7_b2xLo =
+            Bitwise.xor g7_b1Lo g7_c2Lo
+
+        g7_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xHi) (Bitwise.shiftRightZfBy 31 g7_b2xLo)
+
+        g7_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
+
     in
-    { v0 = g4.a
-    , v1 = g5.a
-    , v2 = g6.a
-    , v3 = g7.a
-    , v4 = g7.b
-    , v5 = g4.b
-    , v6 = g5.b
-    , v7 = g6.b
-    , v8 = g6.c
-    , v9 = g7.c
-    , v10 = g4.c
-    , v11 = g5.c
-    , v12 = g5.d
-    , v13 = g6.d
-    , v14 = g7.d
-    , v15 = g4.d
+    { v0 = { hi = g4_a2Hi, lo = g4_a2Lo }
+    , v1 = { hi = g5_a2Hi, lo = g5_a2Lo }
+    , v2 = { hi = g6_a2Hi, lo = g6_a2Lo }
+    , v3 = { hi = g7_a2Hi, lo = g7_a2Lo }
+    , v4 = { hi = g7_b2Hi, lo = g7_b2Lo }
+    , v5 = { hi = g4_b2Hi, lo = g4_b2Lo }
+    , v6 = { hi = g5_b2Hi, lo = g5_b2Lo }
+    , v7 = { hi = g6_b2Hi, lo = g6_b2Lo }
+    , v8 = { hi = g6_c2Hi, lo = g6_c2Lo }
+    , v9 = { hi = g7_c2Hi, lo = g7_c2Lo }
+    , v10 = { hi = g4_c2Hi, lo = g4_c2Lo }
+    , v11 = { hi = g5_c2Hi, lo = g5_c2Lo }
+    , v12 = { hi = g5_d2Hi, lo = g5_d2Lo }
+    , v13 = { hi = g6_d2Hi, lo = g6_d2Lo }
+    , v14 = { hi = g7_d2Hi, lo = g7_d2Lo }
+    , v15 = { hi = g4_d2Hi, lo = g4_d2Lo }
     }
 
 
@@ -297,46 +1369,1199 @@ round0 mb v =
 round1 : U64MessageBlock -> WorkingVector -> WorkingVector
 round1 mb v =
     let
-        g0 =
-            g v.v0 v.v4 v.v8 v.v12 mb.m14 mb.m10
+        -- Column G0: a=v0, b=v4, c=v8, d=v12, x=m14, y=m10
+        -- a1 = add64(add64(a, b), x)
+        g0_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v0.lo + v.v4.lo)
 
-        g1 =
-            g v.v1 v.v5 v.v9 v.v13 mb.m4 mb.m8
+        g0_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v0.lo v.v4.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v0.lo v.v4.lo)
+                        (Bitwise.complement g0_abLo)
+                    )
+                )
 
-        g2 =
-            g v.v2 v.v6 v.v10 v.v14 mb.m9 mb.m15
+        g0_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v0.hi + v.v4.hi + g0_abCarry)
 
-        g3 =
-            g v.v3 v.v7 v.v11 v.v15 mb.m13 mb.m6
+        g0_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_abLo + mb.m14.lo)
 
-        g4 =
-            g g0.a g1.b g2.c g3.d mb.m1 mb.m12
+        g0_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_abLo mb.m14.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_abLo mb.m14.lo)
+                        (Bitwise.complement g0_a1Lo)
+                    )
+                )
 
-        g5 =
-            g g1.a g2.b g3.c g0.d mb.m0 mb.m2
+        g0_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_abHi + mb.m14.hi + g0_a1Carry)
 
-        g6 =
-            g g2.a g3.b g0.c g1.d mb.m11 mb.m7
+        -- d1 = rotr32(xor64(d, a1))
+        g0_d1Hi =
+            Bitwise.xor v.v12.lo g0_a1Lo
 
-        g7 =
-            g g3.a g0.b g1.c g2.d mb.m5 mb.m3
+        g0_d1Lo =
+            Bitwise.xor v.v12.hi g0_a1Hi
+
+        -- c1 = add64(c, d1)
+        g0_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v8.lo + g0_d1Lo)
+
+        g0_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v8.lo g0_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v8.lo g0_d1Lo)
+                        (Bitwise.complement g0_c1Lo)
+                    )
+                )
+
+        g0_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v8.hi + g0_d1Hi + g0_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g0_b1xHi =
+            Bitwise.xor v.v4.hi g0_c1Hi
+
+        g0_b1xLo =
+            Bitwise.xor v.v4.lo g0_c1Lo
+
+        g0_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xHi) (Bitwise.shiftLeftBy 8 g0_b1xLo)
+
+        g0_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xLo) (Bitwise.shiftLeftBy 8 g0_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g0_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1Lo + g0_b1Lo)
+
+        g0_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1Lo g0_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1Lo g0_b1Lo)
+                        (Bitwise.complement g0_a1b1Lo)
+                    )
+                )
+
+        g0_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1Hi + g0_b1Hi + g0_a1b1Carry)
+
+        g0_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Lo + mb.m10.lo)
+
+        g0_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1b1Lo mb.m10.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1b1Lo mb.m10.lo)
+                        (Bitwise.complement g0_a2Lo)
+                    )
+                )
+
+        g0_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Hi + mb.m10.hi + g0_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g0_d2xHi =
+            Bitwise.xor g0_d1Hi g0_a2Hi
+
+        g0_d2xLo =
+            Bitwise.xor g0_d1Lo g0_a2Lo
+
+        g0_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xHi) (Bitwise.shiftLeftBy 16 g0_d2xLo)
+
+        g0_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xLo) (Bitwise.shiftLeftBy 16 g0_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g0_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c1Lo + g0_d2Lo)
+
+        g0_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c1Lo g0_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c1Lo g0_d2Lo)
+                        (Bitwise.complement g0_c2Lo)
+                    )
+                )
+
+        g0_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c1Hi + g0_d2Hi + g0_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g0_b2xHi =
+            Bitwise.xor g0_b1Hi g0_c2Hi
+
+        g0_b2xLo =
+            Bitwise.xor g0_b1Lo g0_c2Lo
+
+        g0_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xHi) (Bitwise.shiftRightZfBy 31 g0_b2xLo)
+
+        g0_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xLo) (Bitwise.shiftRightZfBy 31 g0_b2xHi)
+
+        -- Column G1: a=v1, b=v5, c=v9, d=v13, x=m4, y=m8
+        -- a1 = add64(add64(a, b), x)
+        g1_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v1.lo + v.v5.lo)
+
+        g1_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v1.lo v.v5.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v1.lo v.v5.lo)
+                        (Bitwise.complement g1_abLo)
+                    )
+                )
+
+        g1_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v1.hi + v.v5.hi + g1_abCarry)
+
+        g1_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_abLo + mb.m4.lo)
+
+        g1_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_abLo mb.m4.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_abLo mb.m4.lo)
+                        (Bitwise.complement g1_a1Lo)
+                    )
+                )
+
+        g1_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_abHi + mb.m4.hi + g1_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g1_d1Hi =
+            Bitwise.xor v.v13.lo g1_a1Lo
+
+        g1_d1Lo =
+            Bitwise.xor v.v13.hi g1_a1Hi
+
+        -- c1 = add64(c, d1)
+        g1_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v9.lo + g1_d1Lo)
+
+        g1_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v9.lo g1_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v9.lo g1_d1Lo)
+                        (Bitwise.complement g1_c1Lo)
+                    )
+                )
+
+        g1_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v9.hi + g1_d1Hi + g1_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g1_b1xHi =
+            Bitwise.xor v.v5.hi g1_c1Hi
+
+        g1_b1xLo =
+            Bitwise.xor v.v5.lo g1_c1Lo
+
+        g1_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xHi) (Bitwise.shiftLeftBy 8 g1_b1xLo)
+
+        g1_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xLo) (Bitwise.shiftLeftBy 8 g1_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g1_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1Lo + g1_b1Lo)
+
+        g1_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1Lo g1_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1Lo g1_b1Lo)
+                        (Bitwise.complement g1_a1b1Lo)
+                    )
+                )
+
+        g1_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1Hi + g1_b1Hi + g1_a1b1Carry)
+
+        g1_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Lo + mb.m8.lo)
+
+        g1_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1b1Lo mb.m8.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1b1Lo mb.m8.lo)
+                        (Bitwise.complement g1_a2Lo)
+                    )
+                )
+
+        g1_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Hi + mb.m8.hi + g1_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g1_d2xHi =
+            Bitwise.xor g1_d1Hi g1_a2Hi
+
+        g1_d2xLo =
+            Bitwise.xor g1_d1Lo g1_a2Lo
+
+        g1_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xHi) (Bitwise.shiftLeftBy 16 g1_d2xLo)
+
+        g1_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xLo) (Bitwise.shiftLeftBy 16 g1_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g1_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c1Lo + g1_d2Lo)
+
+        g1_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c1Lo g1_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c1Lo g1_d2Lo)
+                        (Bitwise.complement g1_c2Lo)
+                    )
+                )
+
+        g1_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c1Hi + g1_d2Hi + g1_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g1_b2xHi =
+            Bitwise.xor g1_b1Hi g1_c2Hi
+
+        g1_b2xLo =
+            Bitwise.xor g1_b1Lo g1_c2Lo
+
+        g1_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xHi) (Bitwise.shiftRightZfBy 31 g1_b2xLo)
+
+        g1_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xLo) (Bitwise.shiftRightZfBy 31 g1_b2xHi)
+
+        -- Column G2: a=v2, b=v6, c=v10, d=v14, x=m9, y=m15
+        -- a1 = add64(add64(a, b), x)
+        g2_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v2.lo + v.v6.lo)
+
+        g2_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v2.lo v.v6.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v2.lo v.v6.lo)
+                        (Bitwise.complement g2_abLo)
+                    )
+                )
+
+        g2_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v2.hi + v.v6.hi + g2_abCarry)
+
+        g2_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_abLo + mb.m9.lo)
+
+        g2_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_abLo mb.m9.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_abLo mb.m9.lo)
+                        (Bitwise.complement g2_a1Lo)
+                    )
+                )
+
+        g2_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_abHi + mb.m9.hi + g2_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g2_d1Hi =
+            Bitwise.xor v.v14.lo g2_a1Lo
+
+        g2_d1Lo =
+            Bitwise.xor v.v14.hi g2_a1Hi
+
+        -- c1 = add64(c, d1)
+        g2_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v10.lo + g2_d1Lo)
+
+        g2_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v10.lo g2_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v10.lo g2_d1Lo)
+                        (Bitwise.complement g2_c1Lo)
+                    )
+                )
+
+        g2_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v10.hi + g2_d1Hi + g2_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g2_b1xHi =
+            Bitwise.xor v.v6.hi g2_c1Hi
+
+        g2_b1xLo =
+            Bitwise.xor v.v6.lo g2_c1Lo
+
+        g2_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xHi) (Bitwise.shiftLeftBy 8 g2_b1xLo)
+
+        g2_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xLo) (Bitwise.shiftLeftBy 8 g2_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g2_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1Lo + g2_b1Lo)
+
+        g2_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1Lo g2_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1Lo g2_b1Lo)
+                        (Bitwise.complement g2_a1b1Lo)
+                    )
+                )
+
+        g2_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1Hi + g2_b1Hi + g2_a1b1Carry)
+
+        g2_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Lo + mb.m15.lo)
+
+        g2_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1b1Lo mb.m15.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1b1Lo mb.m15.lo)
+                        (Bitwise.complement g2_a2Lo)
+                    )
+                )
+
+        g2_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Hi + mb.m15.hi + g2_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g2_d2xHi =
+            Bitwise.xor g2_d1Hi g2_a2Hi
+
+        g2_d2xLo =
+            Bitwise.xor g2_d1Lo g2_a2Lo
+
+        g2_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xHi) (Bitwise.shiftLeftBy 16 g2_d2xLo)
+
+        g2_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xLo) (Bitwise.shiftLeftBy 16 g2_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g2_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c1Lo + g2_d2Lo)
+
+        g2_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c1Lo g2_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c1Lo g2_d2Lo)
+                        (Bitwise.complement g2_c2Lo)
+                    )
+                )
+
+        g2_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c1Hi + g2_d2Hi + g2_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g2_b2xHi =
+            Bitwise.xor g2_b1Hi g2_c2Hi
+
+        g2_b2xLo =
+            Bitwise.xor g2_b1Lo g2_c2Lo
+
+        g2_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xHi) (Bitwise.shiftRightZfBy 31 g2_b2xLo)
+
+        g2_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xLo) (Bitwise.shiftRightZfBy 31 g2_b2xHi)
+
+        -- Column G3: a=v3, b=v7, c=v11, d=v15, x=m13, y=m6
+        -- a1 = add64(add64(a, b), x)
+        g3_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v3.lo + v.v7.lo)
+
+        g3_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v3.lo v.v7.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v3.lo v.v7.lo)
+                        (Bitwise.complement g3_abLo)
+                    )
+                )
+
+        g3_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v3.hi + v.v7.hi + g3_abCarry)
+
+        g3_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_abLo + mb.m13.lo)
+
+        g3_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_abLo mb.m13.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_abLo mb.m13.lo)
+                        (Bitwise.complement g3_a1Lo)
+                    )
+                )
+
+        g3_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_abHi + mb.m13.hi + g3_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g3_d1Hi =
+            Bitwise.xor v.v15.lo g3_a1Lo
+
+        g3_d1Lo =
+            Bitwise.xor v.v15.hi g3_a1Hi
+
+        -- c1 = add64(c, d1)
+        g3_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v11.lo + g3_d1Lo)
+
+        g3_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v11.lo g3_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v11.lo g3_d1Lo)
+                        (Bitwise.complement g3_c1Lo)
+                    )
+                )
+
+        g3_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v11.hi + g3_d1Hi + g3_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g3_b1xHi =
+            Bitwise.xor v.v7.hi g3_c1Hi
+
+        g3_b1xLo =
+            Bitwise.xor v.v7.lo g3_c1Lo
+
+        g3_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xHi) (Bitwise.shiftLeftBy 8 g3_b1xLo)
+
+        g3_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xLo) (Bitwise.shiftLeftBy 8 g3_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g3_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1Lo + g3_b1Lo)
+
+        g3_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1Lo g3_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1Lo g3_b1Lo)
+                        (Bitwise.complement g3_a1b1Lo)
+                    )
+                )
+
+        g3_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1Hi + g3_b1Hi + g3_a1b1Carry)
+
+        g3_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Lo + mb.m6.lo)
+
+        g3_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1b1Lo mb.m6.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1b1Lo mb.m6.lo)
+                        (Bitwise.complement g3_a2Lo)
+                    )
+                )
+
+        g3_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Hi + mb.m6.hi + g3_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g3_d2xHi =
+            Bitwise.xor g3_d1Hi g3_a2Hi
+
+        g3_d2xLo =
+            Bitwise.xor g3_d1Lo g3_a2Lo
+
+        g3_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xHi) (Bitwise.shiftLeftBy 16 g3_d2xLo)
+
+        g3_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xLo) (Bitwise.shiftLeftBy 16 g3_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g3_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c1Lo + g3_d2Lo)
+
+        g3_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c1Lo g3_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c1Lo g3_d2Lo)
+                        (Bitwise.complement g3_c2Lo)
+                    )
+                )
+
+        g3_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c1Hi + g3_d2Hi + g3_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g3_b2xHi =
+            Bitwise.xor g3_b1Hi g3_c2Hi
+
+        g3_b2xLo =
+            Bitwise.xor g3_b1Lo g3_c2Lo
+
+        g3_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xHi) (Bitwise.shiftRightZfBy 31 g3_b2xLo)
+
+        g3_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xLo) (Bitwise.shiftRightZfBy 31 g3_b2xHi)
+
+        -- Diagonal G4: a=g0.a, b=g1.b, c=g2.c, d=g3.d, x=m1, y=m12
+        -- a1 = add64(add64(a, b), x)
+        g4_abLo =
+            Bitwise.shiftRightZfBy 0 (g0_a2Lo + g1_b2Lo)
+
+        g4_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a2Lo g1_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a2Lo g1_b2Lo)
+                        (Bitwise.complement g4_abLo)
+                    )
+                )
+
+        g4_abHi =
+            Bitwise.shiftRightZfBy 0 (g0_a2Hi + g1_b2Hi + g4_abCarry)
+
+        g4_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_abLo + mb.m1.lo)
+
+        g4_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_abLo mb.m1.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_abLo mb.m1.lo)
+                        (Bitwise.complement g4_a1Lo)
+                    )
+                )
+
+        g4_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_abHi + mb.m1.hi + g4_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g4_d1Hi =
+            Bitwise.xor g3_d2Lo g4_a1Lo
+
+        g4_d1Lo =
+            Bitwise.xor g3_d2Hi g4_a1Hi
+
+        -- c1 = add64(c, d1)
+        g4_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c2Lo + g4_d1Lo)
+
+        g4_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c2Lo g4_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c2Lo g4_d1Lo)
+                        (Bitwise.complement g4_c1Lo)
+                    )
+                )
+
+        g4_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c2Hi + g4_d1Hi + g4_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g4_b1xHi =
+            Bitwise.xor g1_b2Hi g4_c1Hi
+
+        g4_b1xLo =
+            Bitwise.xor g1_b2Lo g4_c1Lo
+
+        g4_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xHi) (Bitwise.shiftLeftBy 8 g4_b1xLo)
+
+        g4_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xLo) (Bitwise.shiftLeftBy 8 g4_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g4_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1Lo + g4_b1Lo)
+
+        g4_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1Lo g4_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1Lo g4_b1Lo)
+                        (Bitwise.complement g4_a1b1Lo)
+                    )
+                )
+
+        g4_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1Hi + g4_b1Hi + g4_a1b1Carry)
+
+        g4_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Lo + mb.m12.lo)
+
+        g4_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1b1Lo mb.m12.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1b1Lo mb.m12.lo)
+                        (Bitwise.complement g4_a2Lo)
+                    )
+                )
+
+        g4_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Hi + mb.m12.hi + g4_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g4_d2xHi =
+            Bitwise.xor g4_d1Hi g4_a2Hi
+
+        g4_d2xLo =
+            Bitwise.xor g4_d1Lo g4_a2Lo
+
+        g4_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xHi) (Bitwise.shiftLeftBy 16 g4_d2xLo)
+
+        g4_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xLo) (Bitwise.shiftLeftBy 16 g4_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g4_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_c1Lo + g4_d2Lo)
+
+        g4_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_c1Lo g4_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_c1Lo g4_d2Lo)
+                        (Bitwise.complement g4_c2Lo)
+                    )
+                )
+
+        g4_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_c1Hi + g4_d2Hi + g4_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g4_b2xHi =
+            Bitwise.xor g4_b1Hi g4_c2Hi
+
+        g4_b2xLo =
+            Bitwise.xor g4_b1Lo g4_c2Lo
+
+        g4_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xHi) (Bitwise.shiftRightZfBy 31 g4_b2xLo)
+
+        g4_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xLo) (Bitwise.shiftRightZfBy 31 g4_b2xHi)
+
+        -- Diagonal G5: a=g1.a, b=g2.b, c=g3.c, d=g0.d, x=m0, y=m2
+        -- a1 = add64(add64(a, b), x)
+        g5_abLo =
+            Bitwise.shiftRightZfBy 0 (g1_a2Lo + g2_b2Lo)
+
+        g5_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a2Lo g2_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a2Lo g2_b2Lo)
+                        (Bitwise.complement g5_abLo)
+                    )
+                )
+
+        g5_abHi =
+            Bitwise.shiftRightZfBy 0 (g1_a2Hi + g2_b2Hi + g5_abCarry)
+
+        g5_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_abLo + mb.m0.lo)
+
+        g5_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_abLo mb.m0.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_abLo mb.m0.lo)
+                        (Bitwise.complement g5_a1Lo)
+                    )
+                )
+
+        g5_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_abHi + mb.m0.hi + g5_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g5_d1Hi =
+            Bitwise.xor g0_d2Lo g5_a1Lo
+
+        g5_d1Lo =
+            Bitwise.xor g0_d2Hi g5_a1Hi
+
+        -- c1 = add64(c, d1)
+        g5_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c2Lo + g5_d1Lo)
+
+        g5_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c2Lo g5_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c2Lo g5_d1Lo)
+                        (Bitwise.complement g5_c1Lo)
+                    )
+                )
+
+        g5_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c2Hi + g5_d1Hi + g5_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g5_b1xHi =
+            Bitwise.xor g2_b2Hi g5_c1Hi
+
+        g5_b1xLo =
+            Bitwise.xor g2_b2Lo g5_c1Lo
+
+        g5_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xHi) (Bitwise.shiftLeftBy 8 g5_b1xLo)
+
+        g5_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xLo) (Bitwise.shiftLeftBy 8 g5_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g5_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1Lo + g5_b1Lo)
+
+        g5_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1Lo g5_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1Lo g5_b1Lo)
+                        (Bitwise.complement g5_a1b1Lo)
+                    )
+                )
+
+        g5_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1Hi + g5_b1Hi + g5_a1b1Carry)
+
+        g5_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Lo + mb.m2.lo)
+
+        g5_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1b1Lo mb.m2.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1b1Lo mb.m2.lo)
+                        (Bitwise.complement g5_a2Lo)
+                    )
+                )
+
+        g5_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Hi + mb.m2.hi + g5_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g5_d2xHi =
+            Bitwise.xor g5_d1Hi g5_a2Hi
+
+        g5_d2xLo =
+            Bitwise.xor g5_d1Lo g5_a2Lo
+
+        g5_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xHi) (Bitwise.shiftLeftBy 16 g5_d2xLo)
+
+        g5_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xLo) (Bitwise.shiftLeftBy 16 g5_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g5_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_c1Lo + g5_d2Lo)
+
+        g5_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_c1Lo g5_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_c1Lo g5_d2Lo)
+                        (Bitwise.complement g5_c2Lo)
+                    )
+                )
+
+        g5_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_c1Hi + g5_d2Hi + g5_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g5_b2xHi =
+            Bitwise.xor g5_b1Hi g5_c2Hi
+
+        g5_b2xLo =
+            Bitwise.xor g5_b1Lo g5_c2Lo
+
+        g5_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xHi) (Bitwise.shiftRightZfBy 31 g5_b2xLo)
+
+        g5_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xLo) (Bitwise.shiftRightZfBy 31 g5_b2xHi)
+
+        -- Diagonal G6: a=g2.a, b=g3.b, c=g0.c, d=g1.d, x=m11, y=m7
+        -- a1 = add64(add64(a, b), x)
+        g6_abLo =
+            Bitwise.shiftRightZfBy 0 (g2_a2Lo + g3_b2Lo)
+
+        g6_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a2Lo g3_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a2Lo g3_b2Lo)
+                        (Bitwise.complement g6_abLo)
+                    )
+                )
+
+        g6_abHi =
+            Bitwise.shiftRightZfBy 0 (g2_a2Hi + g3_b2Hi + g6_abCarry)
+
+        g6_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_abLo + mb.m11.lo)
+
+        g6_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_abLo mb.m11.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_abLo mb.m11.lo)
+                        (Bitwise.complement g6_a1Lo)
+                    )
+                )
+
+        g6_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_abHi + mb.m11.hi + g6_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g6_d1Hi =
+            Bitwise.xor g1_d2Lo g6_a1Lo
+
+        g6_d1Lo =
+            Bitwise.xor g1_d2Hi g6_a1Hi
+
+        -- c1 = add64(c, d1)
+        g6_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c2Lo + g6_d1Lo)
+
+        g6_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c2Lo g6_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c2Lo g6_d1Lo)
+                        (Bitwise.complement g6_c1Lo)
+                    )
+                )
+
+        g6_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c2Hi + g6_d1Hi + g6_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g6_b1xHi =
+            Bitwise.xor g3_b2Hi g6_c1Hi
+
+        g6_b1xLo =
+            Bitwise.xor g3_b2Lo g6_c1Lo
+
+        g6_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xHi) (Bitwise.shiftLeftBy 8 g6_b1xLo)
+
+        g6_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xLo) (Bitwise.shiftLeftBy 8 g6_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g6_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1Lo + g6_b1Lo)
+
+        g6_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1Lo g6_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1Lo g6_b1Lo)
+                        (Bitwise.complement g6_a1b1Lo)
+                    )
+                )
+
+        g6_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1Hi + g6_b1Hi + g6_a1b1Carry)
+
+        g6_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Lo + mb.m7.lo)
+
+        g6_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1b1Lo mb.m7.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1b1Lo mb.m7.lo)
+                        (Bitwise.complement g6_a2Lo)
+                    )
+                )
+
+        g6_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Hi + mb.m7.hi + g6_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g6_d2xHi =
+            Bitwise.xor g6_d1Hi g6_a2Hi
+
+        g6_d2xLo =
+            Bitwise.xor g6_d1Lo g6_a2Lo
+
+        g6_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xHi) (Bitwise.shiftLeftBy 16 g6_d2xLo)
+
+        g6_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xLo) (Bitwise.shiftLeftBy 16 g6_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g6_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_c1Lo + g6_d2Lo)
+
+        g6_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_c1Lo g6_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_c1Lo g6_d2Lo)
+                        (Bitwise.complement g6_c2Lo)
+                    )
+                )
+
+        g6_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_c1Hi + g6_d2Hi + g6_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g6_b2xHi =
+            Bitwise.xor g6_b1Hi g6_c2Hi
+
+        g6_b2xLo =
+            Bitwise.xor g6_b1Lo g6_c2Lo
+
+        g6_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xHi) (Bitwise.shiftRightZfBy 31 g6_b2xLo)
+
+        g6_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xLo) (Bitwise.shiftRightZfBy 31 g6_b2xHi)
+
+        -- Diagonal G7: a=g3.a, b=g0.b, c=g1.c, d=g2.d, x=m5, y=m3
+        -- a1 = add64(add64(a, b), x)
+        g7_abLo =
+            Bitwise.shiftRightZfBy 0 (g3_a2Lo + g0_b2Lo)
+
+        g7_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a2Lo g0_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a2Lo g0_b2Lo)
+                        (Bitwise.complement g7_abLo)
+                    )
+                )
+
+        g7_abHi =
+            Bitwise.shiftRightZfBy 0 (g3_a2Hi + g0_b2Hi + g7_abCarry)
+
+        g7_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_abLo + mb.m5.lo)
+
+        g7_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_abLo mb.m5.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_abLo mb.m5.lo)
+                        (Bitwise.complement g7_a1Lo)
+                    )
+                )
+
+        g7_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_abHi + mb.m5.hi + g7_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g7_d1Hi =
+            Bitwise.xor g2_d2Lo g7_a1Lo
+
+        g7_d1Lo =
+            Bitwise.xor g2_d2Hi g7_a1Hi
+
+        -- c1 = add64(c, d1)
+        g7_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c2Lo + g7_d1Lo)
+
+        g7_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c2Lo g7_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c2Lo g7_d1Lo)
+                        (Bitwise.complement g7_c1Lo)
+                    )
+                )
+
+        g7_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c2Hi + g7_d1Hi + g7_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g7_b1xHi =
+            Bitwise.xor g0_b2Hi g7_c1Hi
+
+        g7_b1xLo =
+            Bitwise.xor g0_b2Lo g7_c1Lo
+
+        g7_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xHi) (Bitwise.shiftLeftBy 8 g7_b1xLo)
+
+        g7_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xLo) (Bitwise.shiftLeftBy 8 g7_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g7_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1Lo + g7_b1Lo)
+
+        g7_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1Lo g7_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1Lo g7_b1Lo)
+                        (Bitwise.complement g7_a1b1Lo)
+                    )
+                )
+
+        g7_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1Hi + g7_b1Hi + g7_a1b1Carry)
+
+        g7_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Lo + mb.m3.lo)
+
+        g7_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1b1Lo mb.m3.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1b1Lo mb.m3.lo)
+                        (Bitwise.complement g7_a2Lo)
+                    )
+                )
+
+        g7_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Hi + mb.m3.hi + g7_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g7_d2xHi =
+            Bitwise.xor g7_d1Hi g7_a2Hi
+
+        g7_d2xLo =
+            Bitwise.xor g7_d1Lo g7_a2Lo
+
+        g7_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xHi) (Bitwise.shiftLeftBy 16 g7_d2xLo)
+
+        g7_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xLo) (Bitwise.shiftLeftBy 16 g7_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g7_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_c1Lo + g7_d2Lo)
+
+        g7_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_c1Lo g7_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_c1Lo g7_d2Lo)
+                        (Bitwise.complement g7_c2Lo)
+                    )
+                )
+
+        g7_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_c1Hi + g7_d2Hi + g7_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g7_b2xHi =
+            Bitwise.xor g7_b1Hi g7_c2Hi
+
+        g7_b2xLo =
+            Bitwise.xor g7_b1Lo g7_c2Lo
+
+        g7_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xHi) (Bitwise.shiftRightZfBy 31 g7_b2xLo)
+
+        g7_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
+
     in
-    { v0 = g4.a
-    , v1 = g5.a
-    , v2 = g6.a
-    , v3 = g7.a
-    , v4 = g7.b
-    , v5 = g4.b
-    , v6 = g5.b
-    , v7 = g6.b
-    , v8 = g6.c
-    , v9 = g7.c
-    , v10 = g4.c
-    , v11 = g5.c
-    , v12 = g5.d
-    , v13 = g6.d
-    , v14 = g7.d
-    , v15 = g4.d
+    { v0 = { hi = g4_a2Hi, lo = g4_a2Lo }
+    , v1 = { hi = g5_a2Hi, lo = g5_a2Lo }
+    , v2 = { hi = g6_a2Hi, lo = g6_a2Lo }
+    , v3 = { hi = g7_a2Hi, lo = g7_a2Lo }
+    , v4 = { hi = g7_b2Hi, lo = g7_b2Lo }
+    , v5 = { hi = g4_b2Hi, lo = g4_b2Lo }
+    , v6 = { hi = g5_b2Hi, lo = g5_b2Lo }
+    , v7 = { hi = g6_b2Hi, lo = g6_b2Lo }
+    , v8 = { hi = g6_c2Hi, lo = g6_c2Lo }
+    , v9 = { hi = g7_c2Hi, lo = g7_c2Lo }
+    , v10 = { hi = g4_c2Hi, lo = g4_c2Lo }
+    , v11 = { hi = g5_c2Hi, lo = g5_c2Lo }
+    , v12 = { hi = g5_d2Hi, lo = g5_d2Lo }
+    , v13 = { hi = g6_d2Hi, lo = g6_d2Lo }
+    , v14 = { hi = g7_d2Hi, lo = g7_d2Lo }
+    , v15 = { hi = g4_d2Hi, lo = g4_d2Lo }
     }
 
 
@@ -345,46 +2570,1199 @@ round1 mb v =
 round2 : U64MessageBlock -> WorkingVector -> WorkingVector
 round2 mb v =
     let
-        g0 =
-            g v.v0 v.v4 v.v8 v.v12 mb.m11 mb.m8
+        -- Column G0: a=v0, b=v4, c=v8, d=v12, x=m11, y=m8
+        -- a1 = add64(add64(a, b), x)
+        g0_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v0.lo + v.v4.lo)
 
-        g1 =
-            g v.v1 v.v5 v.v9 v.v13 mb.m12 mb.m0
+        g0_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v0.lo v.v4.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v0.lo v.v4.lo)
+                        (Bitwise.complement g0_abLo)
+                    )
+                )
 
-        g2 =
-            g v.v2 v.v6 v.v10 v.v14 mb.m5 mb.m2
+        g0_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v0.hi + v.v4.hi + g0_abCarry)
 
-        g3 =
-            g v.v3 v.v7 v.v11 v.v15 mb.m15 mb.m13
+        g0_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_abLo + mb.m11.lo)
 
-        g4 =
-            g g0.a g1.b g2.c g3.d mb.m10 mb.m14
+        g0_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_abLo mb.m11.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_abLo mb.m11.lo)
+                        (Bitwise.complement g0_a1Lo)
+                    )
+                )
 
-        g5 =
-            g g1.a g2.b g3.c g0.d mb.m3 mb.m6
+        g0_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_abHi + mb.m11.hi + g0_a1Carry)
 
-        g6 =
-            g g2.a g3.b g0.c g1.d mb.m7 mb.m1
+        -- d1 = rotr32(xor64(d, a1))
+        g0_d1Hi =
+            Bitwise.xor v.v12.lo g0_a1Lo
 
-        g7 =
-            g g3.a g0.b g1.c g2.d mb.m9 mb.m4
+        g0_d1Lo =
+            Bitwise.xor v.v12.hi g0_a1Hi
+
+        -- c1 = add64(c, d1)
+        g0_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v8.lo + g0_d1Lo)
+
+        g0_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v8.lo g0_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v8.lo g0_d1Lo)
+                        (Bitwise.complement g0_c1Lo)
+                    )
+                )
+
+        g0_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v8.hi + g0_d1Hi + g0_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g0_b1xHi =
+            Bitwise.xor v.v4.hi g0_c1Hi
+
+        g0_b1xLo =
+            Bitwise.xor v.v4.lo g0_c1Lo
+
+        g0_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xHi) (Bitwise.shiftLeftBy 8 g0_b1xLo)
+
+        g0_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xLo) (Bitwise.shiftLeftBy 8 g0_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g0_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1Lo + g0_b1Lo)
+
+        g0_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1Lo g0_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1Lo g0_b1Lo)
+                        (Bitwise.complement g0_a1b1Lo)
+                    )
+                )
+
+        g0_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1Hi + g0_b1Hi + g0_a1b1Carry)
+
+        g0_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Lo + mb.m8.lo)
+
+        g0_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1b1Lo mb.m8.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1b1Lo mb.m8.lo)
+                        (Bitwise.complement g0_a2Lo)
+                    )
+                )
+
+        g0_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Hi + mb.m8.hi + g0_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g0_d2xHi =
+            Bitwise.xor g0_d1Hi g0_a2Hi
+
+        g0_d2xLo =
+            Bitwise.xor g0_d1Lo g0_a2Lo
+
+        g0_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xHi) (Bitwise.shiftLeftBy 16 g0_d2xLo)
+
+        g0_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xLo) (Bitwise.shiftLeftBy 16 g0_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g0_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c1Lo + g0_d2Lo)
+
+        g0_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c1Lo g0_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c1Lo g0_d2Lo)
+                        (Bitwise.complement g0_c2Lo)
+                    )
+                )
+
+        g0_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c1Hi + g0_d2Hi + g0_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g0_b2xHi =
+            Bitwise.xor g0_b1Hi g0_c2Hi
+
+        g0_b2xLo =
+            Bitwise.xor g0_b1Lo g0_c2Lo
+
+        g0_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xHi) (Bitwise.shiftRightZfBy 31 g0_b2xLo)
+
+        g0_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xLo) (Bitwise.shiftRightZfBy 31 g0_b2xHi)
+
+        -- Column G1: a=v1, b=v5, c=v9, d=v13, x=m12, y=m0
+        -- a1 = add64(add64(a, b), x)
+        g1_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v1.lo + v.v5.lo)
+
+        g1_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v1.lo v.v5.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v1.lo v.v5.lo)
+                        (Bitwise.complement g1_abLo)
+                    )
+                )
+
+        g1_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v1.hi + v.v5.hi + g1_abCarry)
+
+        g1_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_abLo + mb.m12.lo)
+
+        g1_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_abLo mb.m12.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_abLo mb.m12.lo)
+                        (Bitwise.complement g1_a1Lo)
+                    )
+                )
+
+        g1_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_abHi + mb.m12.hi + g1_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g1_d1Hi =
+            Bitwise.xor v.v13.lo g1_a1Lo
+
+        g1_d1Lo =
+            Bitwise.xor v.v13.hi g1_a1Hi
+
+        -- c1 = add64(c, d1)
+        g1_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v9.lo + g1_d1Lo)
+
+        g1_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v9.lo g1_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v9.lo g1_d1Lo)
+                        (Bitwise.complement g1_c1Lo)
+                    )
+                )
+
+        g1_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v9.hi + g1_d1Hi + g1_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g1_b1xHi =
+            Bitwise.xor v.v5.hi g1_c1Hi
+
+        g1_b1xLo =
+            Bitwise.xor v.v5.lo g1_c1Lo
+
+        g1_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xHi) (Bitwise.shiftLeftBy 8 g1_b1xLo)
+
+        g1_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xLo) (Bitwise.shiftLeftBy 8 g1_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g1_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1Lo + g1_b1Lo)
+
+        g1_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1Lo g1_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1Lo g1_b1Lo)
+                        (Bitwise.complement g1_a1b1Lo)
+                    )
+                )
+
+        g1_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1Hi + g1_b1Hi + g1_a1b1Carry)
+
+        g1_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Lo + mb.m0.lo)
+
+        g1_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1b1Lo mb.m0.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1b1Lo mb.m0.lo)
+                        (Bitwise.complement g1_a2Lo)
+                    )
+                )
+
+        g1_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Hi + mb.m0.hi + g1_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g1_d2xHi =
+            Bitwise.xor g1_d1Hi g1_a2Hi
+
+        g1_d2xLo =
+            Bitwise.xor g1_d1Lo g1_a2Lo
+
+        g1_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xHi) (Bitwise.shiftLeftBy 16 g1_d2xLo)
+
+        g1_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xLo) (Bitwise.shiftLeftBy 16 g1_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g1_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c1Lo + g1_d2Lo)
+
+        g1_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c1Lo g1_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c1Lo g1_d2Lo)
+                        (Bitwise.complement g1_c2Lo)
+                    )
+                )
+
+        g1_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c1Hi + g1_d2Hi + g1_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g1_b2xHi =
+            Bitwise.xor g1_b1Hi g1_c2Hi
+
+        g1_b2xLo =
+            Bitwise.xor g1_b1Lo g1_c2Lo
+
+        g1_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xHi) (Bitwise.shiftRightZfBy 31 g1_b2xLo)
+
+        g1_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xLo) (Bitwise.shiftRightZfBy 31 g1_b2xHi)
+
+        -- Column G2: a=v2, b=v6, c=v10, d=v14, x=m5, y=m2
+        -- a1 = add64(add64(a, b), x)
+        g2_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v2.lo + v.v6.lo)
+
+        g2_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v2.lo v.v6.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v2.lo v.v6.lo)
+                        (Bitwise.complement g2_abLo)
+                    )
+                )
+
+        g2_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v2.hi + v.v6.hi + g2_abCarry)
+
+        g2_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_abLo + mb.m5.lo)
+
+        g2_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_abLo mb.m5.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_abLo mb.m5.lo)
+                        (Bitwise.complement g2_a1Lo)
+                    )
+                )
+
+        g2_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_abHi + mb.m5.hi + g2_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g2_d1Hi =
+            Bitwise.xor v.v14.lo g2_a1Lo
+
+        g2_d1Lo =
+            Bitwise.xor v.v14.hi g2_a1Hi
+
+        -- c1 = add64(c, d1)
+        g2_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v10.lo + g2_d1Lo)
+
+        g2_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v10.lo g2_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v10.lo g2_d1Lo)
+                        (Bitwise.complement g2_c1Lo)
+                    )
+                )
+
+        g2_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v10.hi + g2_d1Hi + g2_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g2_b1xHi =
+            Bitwise.xor v.v6.hi g2_c1Hi
+
+        g2_b1xLo =
+            Bitwise.xor v.v6.lo g2_c1Lo
+
+        g2_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xHi) (Bitwise.shiftLeftBy 8 g2_b1xLo)
+
+        g2_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xLo) (Bitwise.shiftLeftBy 8 g2_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g2_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1Lo + g2_b1Lo)
+
+        g2_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1Lo g2_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1Lo g2_b1Lo)
+                        (Bitwise.complement g2_a1b1Lo)
+                    )
+                )
+
+        g2_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1Hi + g2_b1Hi + g2_a1b1Carry)
+
+        g2_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Lo + mb.m2.lo)
+
+        g2_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1b1Lo mb.m2.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1b1Lo mb.m2.lo)
+                        (Bitwise.complement g2_a2Lo)
+                    )
+                )
+
+        g2_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Hi + mb.m2.hi + g2_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g2_d2xHi =
+            Bitwise.xor g2_d1Hi g2_a2Hi
+
+        g2_d2xLo =
+            Bitwise.xor g2_d1Lo g2_a2Lo
+
+        g2_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xHi) (Bitwise.shiftLeftBy 16 g2_d2xLo)
+
+        g2_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xLo) (Bitwise.shiftLeftBy 16 g2_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g2_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c1Lo + g2_d2Lo)
+
+        g2_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c1Lo g2_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c1Lo g2_d2Lo)
+                        (Bitwise.complement g2_c2Lo)
+                    )
+                )
+
+        g2_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c1Hi + g2_d2Hi + g2_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g2_b2xHi =
+            Bitwise.xor g2_b1Hi g2_c2Hi
+
+        g2_b2xLo =
+            Bitwise.xor g2_b1Lo g2_c2Lo
+
+        g2_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xHi) (Bitwise.shiftRightZfBy 31 g2_b2xLo)
+
+        g2_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xLo) (Bitwise.shiftRightZfBy 31 g2_b2xHi)
+
+        -- Column G3: a=v3, b=v7, c=v11, d=v15, x=m15, y=m13
+        -- a1 = add64(add64(a, b), x)
+        g3_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v3.lo + v.v7.lo)
+
+        g3_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v3.lo v.v7.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v3.lo v.v7.lo)
+                        (Bitwise.complement g3_abLo)
+                    )
+                )
+
+        g3_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v3.hi + v.v7.hi + g3_abCarry)
+
+        g3_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_abLo + mb.m15.lo)
+
+        g3_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_abLo mb.m15.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_abLo mb.m15.lo)
+                        (Bitwise.complement g3_a1Lo)
+                    )
+                )
+
+        g3_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_abHi + mb.m15.hi + g3_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g3_d1Hi =
+            Bitwise.xor v.v15.lo g3_a1Lo
+
+        g3_d1Lo =
+            Bitwise.xor v.v15.hi g3_a1Hi
+
+        -- c1 = add64(c, d1)
+        g3_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v11.lo + g3_d1Lo)
+
+        g3_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v11.lo g3_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v11.lo g3_d1Lo)
+                        (Bitwise.complement g3_c1Lo)
+                    )
+                )
+
+        g3_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v11.hi + g3_d1Hi + g3_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g3_b1xHi =
+            Bitwise.xor v.v7.hi g3_c1Hi
+
+        g3_b1xLo =
+            Bitwise.xor v.v7.lo g3_c1Lo
+
+        g3_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xHi) (Bitwise.shiftLeftBy 8 g3_b1xLo)
+
+        g3_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xLo) (Bitwise.shiftLeftBy 8 g3_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g3_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1Lo + g3_b1Lo)
+
+        g3_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1Lo g3_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1Lo g3_b1Lo)
+                        (Bitwise.complement g3_a1b1Lo)
+                    )
+                )
+
+        g3_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1Hi + g3_b1Hi + g3_a1b1Carry)
+
+        g3_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Lo + mb.m13.lo)
+
+        g3_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1b1Lo mb.m13.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1b1Lo mb.m13.lo)
+                        (Bitwise.complement g3_a2Lo)
+                    )
+                )
+
+        g3_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Hi + mb.m13.hi + g3_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g3_d2xHi =
+            Bitwise.xor g3_d1Hi g3_a2Hi
+
+        g3_d2xLo =
+            Bitwise.xor g3_d1Lo g3_a2Lo
+
+        g3_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xHi) (Bitwise.shiftLeftBy 16 g3_d2xLo)
+
+        g3_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xLo) (Bitwise.shiftLeftBy 16 g3_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g3_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c1Lo + g3_d2Lo)
+
+        g3_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c1Lo g3_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c1Lo g3_d2Lo)
+                        (Bitwise.complement g3_c2Lo)
+                    )
+                )
+
+        g3_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c1Hi + g3_d2Hi + g3_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g3_b2xHi =
+            Bitwise.xor g3_b1Hi g3_c2Hi
+
+        g3_b2xLo =
+            Bitwise.xor g3_b1Lo g3_c2Lo
+
+        g3_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xHi) (Bitwise.shiftRightZfBy 31 g3_b2xLo)
+
+        g3_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xLo) (Bitwise.shiftRightZfBy 31 g3_b2xHi)
+
+        -- Diagonal G4: a=g0.a, b=g1.b, c=g2.c, d=g3.d, x=m10, y=m14
+        -- a1 = add64(add64(a, b), x)
+        g4_abLo =
+            Bitwise.shiftRightZfBy 0 (g0_a2Lo + g1_b2Lo)
+
+        g4_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a2Lo g1_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a2Lo g1_b2Lo)
+                        (Bitwise.complement g4_abLo)
+                    )
+                )
+
+        g4_abHi =
+            Bitwise.shiftRightZfBy 0 (g0_a2Hi + g1_b2Hi + g4_abCarry)
+
+        g4_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_abLo + mb.m10.lo)
+
+        g4_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_abLo mb.m10.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_abLo mb.m10.lo)
+                        (Bitwise.complement g4_a1Lo)
+                    )
+                )
+
+        g4_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_abHi + mb.m10.hi + g4_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g4_d1Hi =
+            Bitwise.xor g3_d2Lo g4_a1Lo
+
+        g4_d1Lo =
+            Bitwise.xor g3_d2Hi g4_a1Hi
+
+        -- c1 = add64(c, d1)
+        g4_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c2Lo + g4_d1Lo)
+
+        g4_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c2Lo g4_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c2Lo g4_d1Lo)
+                        (Bitwise.complement g4_c1Lo)
+                    )
+                )
+
+        g4_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c2Hi + g4_d1Hi + g4_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g4_b1xHi =
+            Bitwise.xor g1_b2Hi g4_c1Hi
+
+        g4_b1xLo =
+            Bitwise.xor g1_b2Lo g4_c1Lo
+
+        g4_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xHi) (Bitwise.shiftLeftBy 8 g4_b1xLo)
+
+        g4_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xLo) (Bitwise.shiftLeftBy 8 g4_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g4_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1Lo + g4_b1Lo)
+
+        g4_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1Lo g4_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1Lo g4_b1Lo)
+                        (Bitwise.complement g4_a1b1Lo)
+                    )
+                )
+
+        g4_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1Hi + g4_b1Hi + g4_a1b1Carry)
+
+        g4_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Lo + mb.m14.lo)
+
+        g4_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1b1Lo mb.m14.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1b1Lo mb.m14.lo)
+                        (Bitwise.complement g4_a2Lo)
+                    )
+                )
+
+        g4_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Hi + mb.m14.hi + g4_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g4_d2xHi =
+            Bitwise.xor g4_d1Hi g4_a2Hi
+
+        g4_d2xLo =
+            Bitwise.xor g4_d1Lo g4_a2Lo
+
+        g4_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xHi) (Bitwise.shiftLeftBy 16 g4_d2xLo)
+
+        g4_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xLo) (Bitwise.shiftLeftBy 16 g4_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g4_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_c1Lo + g4_d2Lo)
+
+        g4_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_c1Lo g4_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_c1Lo g4_d2Lo)
+                        (Bitwise.complement g4_c2Lo)
+                    )
+                )
+
+        g4_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_c1Hi + g4_d2Hi + g4_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g4_b2xHi =
+            Bitwise.xor g4_b1Hi g4_c2Hi
+
+        g4_b2xLo =
+            Bitwise.xor g4_b1Lo g4_c2Lo
+
+        g4_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xHi) (Bitwise.shiftRightZfBy 31 g4_b2xLo)
+
+        g4_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xLo) (Bitwise.shiftRightZfBy 31 g4_b2xHi)
+
+        -- Diagonal G5: a=g1.a, b=g2.b, c=g3.c, d=g0.d, x=m3, y=m6
+        -- a1 = add64(add64(a, b), x)
+        g5_abLo =
+            Bitwise.shiftRightZfBy 0 (g1_a2Lo + g2_b2Lo)
+
+        g5_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a2Lo g2_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a2Lo g2_b2Lo)
+                        (Bitwise.complement g5_abLo)
+                    )
+                )
+
+        g5_abHi =
+            Bitwise.shiftRightZfBy 0 (g1_a2Hi + g2_b2Hi + g5_abCarry)
+
+        g5_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_abLo + mb.m3.lo)
+
+        g5_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_abLo mb.m3.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_abLo mb.m3.lo)
+                        (Bitwise.complement g5_a1Lo)
+                    )
+                )
+
+        g5_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_abHi + mb.m3.hi + g5_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g5_d1Hi =
+            Bitwise.xor g0_d2Lo g5_a1Lo
+
+        g5_d1Lo =
+            Bitwise.xor g0_d2Hi g5_a1Hi
+
+        -- c1 = add64(c, d1)
+        g5_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c2Lo + g5_d1Lo)
+
+        g5_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c2Lo g5_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c2Lo g5_d1Lo)
+                        (Bitwise.complement g5_c1Lo)
+                    )
+                )
+
+        g5_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c2Hi + g5_d1Hi + g5_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g5_b1xHi =
+            Bitwise.xor g2_b2Hi g5_c1Hi
+
+        g5_b1xLo =
+            Bitwise.xor g2_b2Lo g5_c1Lo
+
+        g5_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xHi) (Bitwise.shiftLeftBy 8 g5_b1xLo)
+
+        g5_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xLo) (Bitwise.shiftLeftBy 8 g5_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g5_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1Lo + g5_b1Lo)
+
+        g5_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1Lo g5_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1Lo g5_b1Lo)
+                        (Bitwise.complement g5_a1b1Lo)
+                    )
+                )
+
+        g5_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1Hi + g5_b1Hi + g5_a1b1Carry)
+
+        g5_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Lo + mb.m6.lo)
+
+        g5_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1b1Lo mb.m6.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1b1Lo mb.m6.lo)
+                        (Bitwise.complement g5_a2Lo)
+                    )
+                )
+
+        g5_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Hi + mb.m6.hi + g5_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g5_d2xHi =
+            Bitwise.xor g5_d1Hi g5_a2Hi
+
+        g5_d2xLo =
+            Bitwise.xor g5_d1Lo g5_a2Lo
+
+        g5_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xHi) (Bitwise.shiftLeftBy 16 g5_d2xLo)
+
+        g5_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xLo) (Bitwise.shiftLeftBy 16 g5_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g5_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_c1Lo + g5_d2Lo)
+
+        g5_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_c1Lo g5_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_c1Lo g5_d2Lo)
+                        (Bitwise.complement g5_c2Lo)
+                    )
+                )
+
+        g5_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_c1Hi + g5_d2Hi + g5_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g5_b2xHi =
+            Bitwise.xor g5_b1Hi g5_c2Hi
+
+        g5_b2xLo =
+            Bitwise.xor g5_b1Lo g5_c2Lo
+
+        g5_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xHi) (Bitwise.shiftRightZfBy 31 g5_b2xLo)
+
+        g5_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xLo) (Bitwise.shiftRightZfBy 31 g5_b2xHi)
+
+        -- Diagonal G6: a=g2.a, b=g3.b, c=g0.c, d=g1.d, x=m7, y=m1
+        -- a1 = add64(add64(a, b), x)
+        g6_abLo =
+            Bitwise.shiftRightZfBy 0 (g2_a2Lo + g3_b2Lo)
+
+        g6_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a2Lo g3_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a2Lo g3_b2Lo)
+                        (Bitwise.complement g6_abLo)
+                    )
+                )
+
+        g6_abHi =
+            Bitwise.shiftRightZfBy 0 (g2_a2Hi + g3_b2Hi + g6_abCarry)
+
+        g6_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_abLo + mb.m7.lo)
+
+        g6_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_abLo mb.m7.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_abLo mb.m7.lo)
+                        (Bitwise.complement g6_a1Lo)
+                    )
+                )
+
+        g6_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_abHi + mb.m7.hi + g6_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g6_d1Hi =
+            Bitwise.xor g1_d2Lo g6_a1Lo
+
+        g6_d1Lo =
+            Bitwise.xor g1_d2Hi g6_a1Hi
+
+        -- c1 = add64(c, d1)
+        g6_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c2Lo + g6_d1Lo)
+
+        g6_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c2Lo g6_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c2Lo g6_d1Lo)
+                        (Bitwise.complement g6_c1Lo)
+                    )
+                )
+
+        g6_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c2Hi + g6_d1Hi + g6_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g6_b1xHi =
+            Bitwise.xor g3_b2Hi g6_c1Hi
+
+        g6_b1xLo =
+            Bitwise.xor g3_b2Lo g6_c1Lo
+
+        g6_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xHi) (Bitwise.shiftLeftBy 8 g6_b1xLo)
+
+        g6_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xLo) (Bitwise.shiftLeftBy 8 g6_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g6_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1Lo + g6_b1Lo)
+
+        g6_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1Lo g6_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1Lo g6_b1Lo)
+                        (Bitwise.complement g6_a1b1Lo)
+                    )
+                )
+
+        g6_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1Hi + g6_b1Hi + g6_a1b1Carry)
+
+        g6_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Lo + mb.m1.lo)
+
+        g6_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1b1Lo mb.m1.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1b1Lo mb.m1.lo)
+                        (Bitwise.complement g6_a2Lo)
+                    )
+                )
+
+        g6_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Hi + mb.m1.hi + g6_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g6_d2xHi =
+            Bitwise.xor g6_d1Hi g6_a2Hi
+
+        g6_d2xLo =
+            Bitwise.xor g6_d1Lo g6_a2Lo
+
+        g6_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xHi) (Bitwise.shiftLeftBy 16 g6_d2xLo)
+
+        g6_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xLo) (Bitwise.shiftLeftBy 16 g6_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g6_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_c1Lo + g6_d2Lo)
+
+        g6_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_c1Lo g6_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_c1Lo g6_d2Lo)
+                        (Bitwise.complement g6_c2Lo)
+                    )
+                )
+
+        g6_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_c1Hi + g6_d2Hi + g6_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g6_b2xHi =
+            Bitwise.xor g6_b1Hi g6_c2Hi
+
+        g6_b2xLo =
+            Bitwise.xor g6_b1Lo g6_c2Lo
+
+        g6_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xHi) (Bitwise.shiftRightZfBy 31 g6_b2xLo)
+
+        g6_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xLo) (Bitwise.shiftRightZfBy 31 g6_b2xHi)
+
+        -- Diagonal G7: a=g3.a, b=g0.b, c=g1.c, d=g2.d, x=m9, y=m4
+        -- a1 = add64(add64(a, b), x)
+        g7_abLo =
+            Bitwise.shiftRightZfBy 0 (g3_a2Lo + g0_b2Lo)
+
+        g7_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a2Lo g0_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a2Lo g0_b2Lo)
+                        (Bitwise.complement g7_abLo)
+                    )
+                )
+
+        g7_abHi =
+            Bitwise.shiftRightZfBy 0 (g3_a2Hi + g0_b2Hi + g7_abCarry)
+
+        g7_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_abLo + mb.m9.lo)
+
+        g7_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_abLo mb.m9.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_abLo mb.m9.lo)
+                        (Bitwise.complement g7_a1Lo)
+                    )
+                )
+
+        g7_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_abHi + mb.m9.hi + g7_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g7_d1Hi =
+            Bitwise.xor g2_d2Lo g7_a1Lo
+
+        g7_d1Lo =
+            Bitwise.xor g2_d2Hi g7_a1Hi
+
+        -- c1 = add64(c, d1)
+        g7_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c2Lo + g7_d1Lo)
+
+        g7_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c2Lo g7_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c2Lo g7_d1Lo)
+                        (Bitwise.complement g7_c1Lo)
+                    )
+                )
+
+        g7_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c2Hi + g7_d1Hi + g7_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g7_b1xHi =
+            Bitwise.xor g0_b2Hi g7_c1Hi
+
+        g7_b1xLo =
+            Bitwise.xor g0_b2Lo g7_c1Lo
+
+        g7_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xHi) (Bitwise.shiftLeftBy 8 g7_b1xLo)
+
+        g7_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xLo) (Bitwise.shiftLeftBy 8 g7_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g7_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1Lo + g7_b1Lo)
+
+        g7_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1Lo g7_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1Lo g7_b1Lo)
+                        (Bitwise.complement g7_a1b1Lo)
+                    )
+                )
+
+        g7_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1Hi + g7_b1Hi + g7_a1b1Carry)
+
+        g7_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Lo + mb.m4.lo)
+
+        g7_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1b1Lo mb.m4.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1b1Lo mb.m4.lo)
+                        (Bitwise.complement g7_a2Lo)
+                    )
+                )
+
+        g7_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Hi + mb.m4.hi + g7_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g7_d2xHi =
+            Bitwise.xor g7_d1Hi g7_a2Hi
+
+        g7_d2xLo =
+            Bitwise.xor g7_d1Lo g7_a2Lo
+
+        g7_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xHi) (Bitwise.shiftLeftBy 16 g7_d2xLo)
+
+        g7_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xLo) (Bitwise.shiftLeftBy 16 g7_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g7_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_c1Lo + g7_d2Lo)
+
+        g7_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_c1Lo g7_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_c1Lo g7_d2Lo)
+                        (Bitwise.complement g7_c2Lo)
+                    )
+                )
+
+        g7_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_c1Hi + g7_d2Hi + g7_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g7_b2xHi =
+            Bitwise.xor g7_b1Hi g7_c2Hi
+
+        g7_b2xLo =
+            Bitwise.xor g7_b1Lo g7_c2Lo
+
+        g7_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xHi) (Bitwise.shiftRightZfBy 31 g7_b2xLo)
+
+        g7_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
+
     in
-    { v0 = g4.a
-    , v1 = g5.a
-    , v2 = g6.a
-    , v3 = g7.a
-    , v4 = g7.b
-    , v5 = g4.b
-    , v6 = g5.b
-    , v7 = g6.b
-    , v8 = g6.c
-    , v9 = g7.c
-    , v10 = g4.c
-    , v11 = g5.c
-    , v12 = g5.d
-    , v13 = g6.d
-    , v14 = g7.d
-    , v15 = g4.d
+    { v0 = { hi = g4_a2Hi, lo = g4_a2Lo }
+    , v1 = { hi = g5_a2Hi, lo = g5_a2Lo }
+    , v2 = { hi = g6_a2Hi, lo = g6_a2Lo }
+    , v3 = { hi = g7_a2Hi, lo = g7_a2Lo }
+    , v4 = { hi = g7_b2Hi, lo = g7_b2Lo }
+    , v5 = { hi = g4_b2Hi, lo = g4_b2Lo }
+    , v6 = { hi = g5_b2Hi, lo = g5_b2Lo }
+    , v7 = { hi = g6_b2Hi, lo = g6_b2Lo }
+    , v8 = { hi = g6_c2Hi, lo = g6_c2Lo }
+    , v9 = { hi = g7_c2Hi, lo = g7_c2Lo }
+    , v10 = { hi = g4_c2Hi, lo = g4_c2Lo }
+    , v11 = { hi = g5_c2Hi, lo = g5_c2Lo }
+    , v12 = { hi = g5_d2Hi, lo = g5_d2Lo }
+    , v13 = { hi = g6_d2Hi, lo = g6_d2Lo }
+    , v14 = { hi = g7_d2Hi, lo = g7_d2Lo }
+    , v15 = { hi = g4_d2Hi, lo = g4_d2Lo }
     }
 
 
@@ -393,46 +3771,1199 @@ round2 mb v =
 round3 : U64MessageBlock -> WorkingVector -> WorkingVector
 round3 mb v =
     let
-        g0 =
-            g v.v0 v.v4 v.v8 v.v12 mb.m7 mb.m9
+        -- Column G0: a=v0, b=v4, c=v8, d=v12, x=m7, y=m9
+        -- a1 = add64(add64(a, b), x)
+        g0_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v0.lo + v.v4.lo)
 
-        g1 =
-            g v.v1 v.v5 v.v9 v.v13 mb.m3 mb.m1
+        g0_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v0.lo v.v4.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v0.lo v.v4.lo)
+                        (Bitwise.complement g0_abLo)
+                    )
+                )
 
-        g2 =
-            g v.v2 v.v6 v.v10 v.v14 mb.m13 mb.m12
+        g0_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v0.hi + v.v4.hi + g0_abCarry)
 
-        g3 =
-            g v.v3 v.v7 v.v11 v.v15 mb.m11 mb.m14
+        g0_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_abLo + mb.m7.lo)
 
-        g4 =
-            g g0.a g1.b g2.c g3.d mb.m2 mb.m6
+        g0_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_abLo mb.m7.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_abLo mb.m7.lo)
+                        (Bitwise.complement g0_a1Lo)
+                    )
+                )
 
-        g5 =
-            g g1.a g2.b g3.c g0.d mb.m5 mb.m10
+        g0_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_abHi + mb.m7.hi + g0_a1Carry)
 
-        g6 =
-            g g2.a g3.b g0.c g1.d mb.m4 mb.m0
+        -- d1 = rotr32(xor64(d, a1))
+        g0_d1Hi =
+            Bitwise.xor v.v12.lo g0_a1Lo
 
-        g7 =
-            g g3.a g0.b g1.c g2.d mb.m15 mb.m8
+        g0_d1Lo =
+            Bitwise.xor v.v12.hi g0_a1Hi
+
+        -- c1 = add64(c, d1)
+        g0_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v8.lo + g0_d1Lo)
+
+        g0_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v8.lo g0_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v8.lo g0_d1Lo)
+                        (Bitwise.complement g0_c1Lo)
+                    )
+                )
+
+        g0_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v8.hi + g0_d1Hi + g0_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g0_b1xHi =
+            Bitwise.xor v.v4.hi g0_c1Hi
+
+        g0_b1xLo =
+            Bitwise.xor v.v4.lo g0_c1Lo
+
+        g0_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xHi) (Bitwise.shiftLeftBy 8 g0_b1xLo)
+
+        g0_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xLo) (Bitwise.shiftLeftBy 8 g0_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g0_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1Lo + g0_b1Lo)
+
+        g0_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1Lo g0_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1Lo g0_b1Lo)
+                        (Bitwise.complement g0_a1b1Lo)
+                    )
+                )
+
+        g0_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1Hi + g0_b1Hi + g0_a1b1Carry)
+
+        g0_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Lo + mb.m9.lo)
+
+        g0_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1b1Lo mb.m9.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1b1Lo mb.m9.lo)
+                        (Bitwise.complement g0_a2Lo)
+                    )
+                )
+
+        g0_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Hi + mb.m9.hi + g0_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g0_d2xHi =
+            Bitwise.xor g0_d1Hi g0_a2Hi
+
+        g0_d2xLo =
+            Bitwise.xor g0_d1Lo g0_a2Lo
+
+        g0_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xHi) (Bitwise.shiftLeftBy 16 g0_d2xLo)
+
+        g0_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xLo) (Bitwise.shiftLeftBy 16 g0_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g0_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c1Lo + g0_d2Lo)
+
+        g0_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c1Lo g0_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c1Lo g0_d2Lo)
+                        (Bitwise.complement g0_c2Lo)
+                    )
+                )
+
+        g0_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c1Hi + g0_d2Hi + g0_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g0_b2xHi =
+            Bitwise.xor g0_b1Hi g0_c2Hi
+
+        g0_b2xLo =
+            Bitwise.xor g0_b1Lo g0_c2Lo
+
+        g0_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xHi) (Bitwise.shiftRightZfBy 31 g0_b2xLo)
+
+        g0_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xLo) (Bitwise.shiftRightZfBy 31 g0_b2xHi)
+
+        -- Column G1: a=v1, b=v5, c=v9, d=v13, x=m3, y=m1
+        -- a1 = add64(add64(a, b), x)
+        g1_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v1.lo + v.v5.lo)
+
+        g1_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v1.lo v.v5.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v1.lo v.v5.lo)
+                        (Bitwise.complement g1_abLo)
+                    )
+                )
+
+        g1_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v1.hi + v.v5.hi + g1_abCarry)
+
+        g1_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_abLo + mb.m3.lo)
+
+        g1_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_abLo mb.m3.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_abLo mb.m3.lo)
+                        (Bitwise.complement g1_a1Lo)
+                    )
+                )
+
+        g1_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_abHi + mb.m3.hi + g1_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g1_d1Hi =
+            Bitwise.xor v.v13.lo g1_a1Lo
+
+        g1_d1Lo =
+            Bitwise.xor v.v13.hi g1_a1Hi
+
+        -- c1 = add64(c, d1)
+        g1_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v9.lo + g1_d1Lo)
+
+        g1_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v9.lo g1_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v9.lo g1_d1Lo)
+                        (Bitwise.complement g1_c1Lo)
+                    )
+                )
+
+        g1_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v9.hi + g1_d1Hi + g1_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g1_b1xHi =
+            Bitwise.xor v.v5.hi g1_c1Hi
+
+        g1_b1xLo =
+            Bitwise.xor v.v5.lo g1_c1Lo
+
+        g1_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xHi) (Bitwise.shiftLeftBy 8 g1_b1xLo)
+
+        g1_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xLo) (Bitwise.shiftLeftBy 8 g1_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g1_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1Lo + g1_b1Lo)
+
+        g1_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1Lo g1_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1Lo g1_b1Lo)
+                        (Bitwise.complement g1_a1b1Lo)
+                    )
+                )
+
+        g1_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1Hi + g1_b1Hi + g1_a1b1Carry)
+
+        g1_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Lo + mb.m1.lo)
+
+        g1_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1b1Lo mb.m1.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1b1Lo mb.m1.lo)
+                        (Bitwise.complement g1_a2Lo)
+                    )
+                )
+
+        g1_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Hi + mb.m1.hi + g1_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g1_d2xHi =
+            Bitwise.xor g1_d1Hi g1_a2Hi
+
+        g1_d2xLo =
+            Bitwise.xor g1_d1Lo g1_a2Lo
+
+        g1_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xHi) (Bitwise.shiftLeftBy 16 g1_d2xLo)
+
+        g1_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xLo) (Bitwise.shiftLeftBy 16 g1_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g1_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c1Lo + g1_d2Lo)
+
+        g1_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c1Lo g1_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c1Lo g1_d2Lo)
+                        (Bitwise.complement g1_c2Lo)
+                    )
+                )
+
+        g1_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c1Hi + g1_d2Hi + g1_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g1_b2xHi =
+            Bitwise.xor g1_b1Hi g1_c2Hi
+
+        g1_b2xLo =
+            Bitwise.xor g1_b1Lo g1_c2Lo
+
+        g1_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xHi) (Bitwise.shiftRightZfBy 31 g1_b2xLo)
+
+        g1_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xLo) (Bitwise.shiftRightZfBy 31 g1_b2xHi)
+
+        -- Column G2: a=v2, b=v6, c=v10, d=v14, x=m13, y=m12
+        -- a1 = add64(add64(a, b), x)
+        g2_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v2.lo + v.v6.lo)
+
+        g2_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v2.lo v.v6.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v2.lo v.v6.lo)
+                        (Bitwise.complement g2_abLo)
+                    )
+                )
+
+        g2_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v2.hi + v.v6.hi + g2_abCarry)
+
+        g2_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_abLo + mb.m13.lo)
+
+        g2_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_abLo mb.m13.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_abLo mb.m13.lo)
+                        (Bitwise.complement g2_a1Lo)
+                    )
+                )
+
+        g2_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_abHi + mb.m13.hi + g2_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g2_d1Hi =
+            Bitwise.xor v.v14.lo g2_a1Lo
+
+        g2_d1Lo =
+            Bitwise.xor v.v14.hi g2_a1Hi
+
+        -- c1 = add64(c, d1)
+        g2_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v10.lo + g2_d1Lo)
+
+        g2_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v10.lo g2_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v10.lo g2_d1Lo)
+                        (Bitwise.complement g2_c1Lo)
+                    )
+                )
+
+        g2_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v10.hi + g2_d1Hi + g2_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g2_b1xHi =
+            Bitwise.xor v.v6.hi g2_c1Hi
+
+        g2_b1xLo =
+            Bitwise.xor v.v6.lo g2_c1Lo
+
+        g2_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xHi) (Bitwise.shiftLeftBy 8 g2_b1xLo)
+
+        g2_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xLo) (Bitwise.shiftLeftBy 8 g2_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g2_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1Lo + g2_b1Lo)
+
+        g2_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1Lo g2_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1Lo g2_b1Lo)
+                        (Bitwise.complement g2_a1b1Lo)
+                    )
+                )
+
+        g2_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1Hi + g2_b1Hi + g2_a1b1Carry)
+
+        g2_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Lo + mb.m12.lo)
+
+        g2_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1b1Lo mb.m12.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1b1Lo mb.m12.lo)
+                        (Bitwise.complement g2_a2Lo)
+                    )
+                )
+
+        g2_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Hi + mb.m12.hi + g2_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g2_d2xHi =
+            Bitwise.xor g2_d1Hi g2_a2Hi
+
+        g2_d2xLo =
+            Bitwise.xor g2_d1Lo g2_a2Lo
+
+        g2_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xHi) (Bitwise.shiftLeftBy 16 g2_d2xLo)
+
+        g2_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xLo) (Bitwise.shiftLeftBy 16 g2_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g2_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c1Lo + g2_d2Lo)
+
+        g2_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c1Lo g2_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c1Lo g2_d2Lo)
+                        (Bitwise.complement g2_c2Lo)
+                    )
+                )
+
+        g2_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c1Hi + g2_d2Hi + g2_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g2_b2xHi =
+            Bitwise.xor g2_b1Hi g2_c2Hi
+
+        g2_b2xLo =
+            Bitwise.xor g2_b1Lo g2_c2Lo
+
+        g2_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xHi) (Bitwise.shiftRightZfBy 31 g2_b2xLo)
+
+        g2_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xLo) (Bitwise.shiftRightZfBy 31 g2_b2xHi)
+
+        -- Column G3: a=v3, b=v7, c=v11, d=v15, x=m11, y=m14
+        -- a1 = add64(add64(a, b), x)
+        g3_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v3.lo + v.v7.lo)
+
+        g3_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v3.lo v.v7.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v3.lo v.v7.lo)
+                        (Bitwise.complement g3_abLo)
+                    )
+                )
+
+        g3_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v3.hi + v.v7.hi + g3_abCarry)
+
+        g3_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_abLo + mb.m11.lo)
+
+        g3_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_abLo mb.m11.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_abLo mb.m11.lo)
+                        (Bitwise.complement g3_a1Lo)
+                    )
+                )
+
+        g3_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_abHi + mb.m11.hi + g3_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g3_d1Hi =
+            Bitwise.xor v.v15.lo g3_a1Lo
+
+        g3_d1Lo =
+            Bitwise.xor v.v15.hi g3_a1Hi
+
+        -- c1 = add64(c, d1)
+        g3_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v11.lo + g3_d1Lo)
+
+        g3_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v11.lo g3_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v11.lo g3_d1Lo)
+                        (Bitwise.complement g3_c1Lo)
+                    )
+                )
+
+        g3_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v11.hi + g3_d1Hi + g3_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g3_b1xHi =
+            Bitwise.xor v.v7.hi g3_c1Hi
+
+        g3_b1xLo =
+            Bitwise.xor v.v7.lo g3_c1Lo
+
+        g3_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xHi) (Bitwise.shiftLeftBy 8 g3_b1xLo)
+
+        g3_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xLo) (Bitwise.shiftLeftBy 8 g3_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g3_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1Lo + g3_b1Lo)
+
+        g3_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1Lo g3_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1Lo g3_b1Lo)
+                        (Bitwise.complement g3_a1b1Lo)
+                    )
+                )
+
+        g3_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1Hi + g3_b1Hi + g3_a1b1Carry)
+
+        g3_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Lo + mb.m14.lo)
+
+        g3_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1b1Lo mb.m14.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1b1Lo mb.m14.lo)
+                        (Bitwise.complement g3_a2Lo)
+                    )
+                )
+
+        g3_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Hi + mb.m14.hi + g3_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g3_d2xHi =
+            Bitwise.xor g3_d1Hi g3_a2Hi
+
+        g3_d2xLo =
+            Bitwise.xor g3_d1Lo g3_a2Lo
+
+        g3_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xHi) (Bitwise.shiftLeftBy 16 g3_d2xLo)
+
+        g3_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xLo) (Bitwise.shiftLeftBy 16 g3_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g3_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c1Lo + g3_d2Lo)
+
+        g3_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c1Lo g3_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c1Lo g3_d2Lo)
+                        (Bitwise.complement g3_c2Lo)
+                    )
+                )
+
+        g3_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c1Hi + g3_d2Hi + g3_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g3_b2xHi =
+            Bitwise.xor g3_b1Hi g3_c2Hi
+
+        g3_b2xLo =
+            Bitwise.xor g3_b1Lo g3_c2Lo
+
+        g3_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xHi) (Bitwise.shiftRightZfBy 31 g3_b2xLo)
+
+        g3_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xLo) (Bitwise.shiftRightZfBy 31 g3_b2xHi)
+
+        -- Diagonal G4: a=g0.a, b=g1.b, c=g2.c, d=g3.d, x=m2, y=m6
+        -- a1 = add64(add64(a, b), x)
+        g4_abLo =
+            Bitwise.shiftRightZfBy 0 (g0_a2Lo + g1_b2Lo)
+
+        g4_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a2Lo g1_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a2Lo g1_b2Lo)
+                        (Bitwise.complement g4_abLo)
+                    )
+                )
+
+        g4_abHi =
+            Bitwise.shiftRightZfBy 0 (g0_a2Hi + g1_b2Hi + g4_abCarry)
+
+        g4_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_abLo + mb.m2.lo)
+
+        g4_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_abLo mb.m2.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_abLo mb.m2.lo)
+                        (Bitwise.complement g4_a1Lo)
+                    )
+                )
+
+        g4_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_abHi + mb.m2.hi + g4_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g4_d1Hi =
+            Bitwise.xor g3_d2Lo g4_a1Lo
+
+        g4_d1Lo =
+            Bitwise.xor g3_d2Hi g4_a1Hi
+
+        -- c1 = add64(c, d1)
+        g4_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c2Lo + g4_d1Lo)
+
+        g4_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c2Lo g4_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c2Lo g4_d1Lo)
+                        (Bitwise.complement g4_c1Lo)
+                    )
+                )
+
+        g4_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c2Hi + g4_d1Hi + g4_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g4_b1xHi =
+            Bitwise.xor g1_b2Hi g4_c1Hi
+
+        g4_b1xLo =
+            Bitwise.xor g1_b2Lo g4_c1Lo
+
+        g4_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xHi) (Bitwise.shiftLeftBy 8 g4_b1xLo)
+
+        g4_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xLo) (Bitwise.shiftLeftBy 8 g4_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g4_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1Lo + g4_b1Lo)
+
+        g4_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1Lo g4_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1Lo g4_b1Lo)
+                        (Bitwise.complement g4_a1b1Lo)
+                    )
+                )
+
+        g4_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1Hi + g4_b1Hi + g4_a1b1Carry)
+
+        g4_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Lo + mb.m6.lo)
+
+        g4_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1b1Lo mb.m6.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1b1Lo mb.m6.lo)
+                        (Bitwise.complement g4_a2Lo)
+                    )
+                )
+
+        g4_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Hi + mb.m6.hi + g4_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g4_d2xHi =
+            Bitwise.xor g4_d1Hi g4_a2Hi
+
+        g4_d2xLo =
+            Bitwise.xor g4_d1Lo g4_a2Lo
+
+        g4_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xHi) (Bitwise.shiftLeftBy 16 g4_d2xLo)
+
+        g4_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xLo) (Bitwise.shiftLeftBy 16 g4_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g4_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_c1Lo + g4_d2Lo)
+
+        g4_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_c1Lo g4_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_c1Lo g4_d2Lo)
+                        (Bitwise.complement g4_c2Lo)
+                    )
+                )
+
+        g4_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_c1Hi + g4_d2Hi + g4_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g4_b2xHi =
+            Bitwise.xor g4_b1Hi g4_c2Hi
+
+        g4_b2xLo =
+            Bitwise.xor g4_b1Lo g4_c2Lo
+
+        g4_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xHi) (Bitwise.shiftRightZfBy 31 g4_b2xLo)
+
+        g4_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xLo) (Bitwise.shiftRightZfBy 31 g4_b2xHi)
+
+        -- Diagonal G5: a=g1.a, b=g2.b, c=g3.c, d=g0.d, x=m5, y=m10
+        -- a1 = add64(add64(a, b), x)
+        g5_abLo =
+            Bitwise.shiftRightZfBy 0 (g1_a2Lo + g2_b2Lo)
+
+        g5_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a2Lo g2_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a2Lo g2_b2Lo)
+                        (Bitwise.complement g5_abLo)
+                    )
+                )
+
+        g5_abHi =
+            Bitwise.shiftRightZfBy 0 (g1_a2Hi + g2_b2Hi + g5_abCarry)
+
+        g5_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_abLo + mb.m5.lo)
+
+        g5_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_abLo mb.m5.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_abLo mb.m5.lo)
+                        (Bitwise.complement g5_a1Lo)
+                    )
+                )
+
+        g5_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_abHi + mb.m5.hi + g5_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g5_d1Hi =
+            Bitwise.xor g0_d2Lo g5_a1Lo
+
+        g5_d1Lo =
+            Bitwise.xor g0_d2Hi g5_a1Hi
+
+        -- c1 = add64(c, d1)
+        g5_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c2Lo + g5_d1Lo)
+
+        g5_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c2Lo g5_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c2Lo g5_d1Lo)
+                        (Bitwise.complement g5_c1Lo)
+                    )
+                )
+
+        g5_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c2Hi + g5_d1Hi + g5_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g5_b1xHi =
+            Bitwise.xor g2_b2Hi g5_c1Hi
+
+        g5_b1xLo =
+            Bitwise.xor g2_b2Lo g5_c1Lo
+
+        g5_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xHi) (Bitwise.shiftLeftBy 8 g5_b1xLo)
+
+        g5_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xLo) (Bitwise.shiftLeftBy 8 g5_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g5_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1Lo + g5_b1Lo)
+
+        g5_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1Lo g5_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1Lo g5_b1Lo)
+                        (Bitwise.complement g5_a1b1Lo)
+                    )
+                )
+
+        g5_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1Hi + g5_b1Hi + g5_a1b1Carry)
+
+        g5_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Lo + mb.m10.lo)
+
+        g5_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1b1Lo mb.m10.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1b1Lo mb.m10.lo)
+                        (Bitwise.complement g5_a2Lo)
+                    )
+                )
+
+        g5_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Hi + mb.m10.hi + g5_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g5_d2xHi =
+            Bitwise.xor g5_d1Hi g5_a2Hi
+
+        g5_d2xLo =
+            Bitwise.xor g5_d1Lo g5_a2Lo
+
+        g5_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xHi) (Bitwise.shiftLeftBy 16 g5_d2xLo)
+
+        g5_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xLo) (Bitwise.shiftLeftBy 16 g5_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g5_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_c1Lo + g5_d2Lo)
+
+        g5_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_c1Lo g5_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_c1Lo g5_d2Lo)
+                        (Bitwise.complement g5_c2Lo)
+                    )
+                )
+
+        g5_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_c1Hi + g5_d2Hi + g5_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g5_b2xHi =
+            Bitwise.xor g5_b1Hi g5_c2Hi
+
+        g5_b2xLo =
+            Bitwise.xor g5_b1Lo g5_c2Lo
+
+        g5_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xHi) (Bitwise.shiftRightZfBy 31 g5_b2xLo)
+
+        g5_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xLo) (Bitwise.shiftRightZfBy 31 g5_b2xHi)
+
+        -- Diagonal G6: a=g2.a, b=g3.b, c=g0.c, d=g1.d, x=m4, y=m0
+        -- a1 = add64(add64(a, b), x)
+        g6_abLo =
+            Bitwise.shiftRightZfBy 0 (g2_a2Lo + g3_b2Lo)
+
+        g6_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a2Lo g3_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a2Lo g3_b2Lo)
+                        (Bitwise.complement g6_abLo)
+                    )
+                )
+
+        g6_abHi =
+            Bitwise.shiftRightZfBy 0 (g2_a2Hi + g3_b2Hi + g6_abCarry)
+
+        g6_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_abLo + mb.m4.lo)
+
+        g6_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_abLo mb.m4.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_abLo mb.m4.lo)
+                        (Bitwise.complement g6_a1Lo)
+                    )
+                )
+
+        g6_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_abHi + mb.m4.hi + g6_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g6_d1Hi =
+            Bitwise.xor g1_d2Lo g6_a1Lo
+
+        g6_d1Lo =
+            Bitwise.xor g1_d2Hi g6_a1Hi
+
+        -- c1 = add64(c, d1)
+        g6_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c2Lo + g6_d1Lo)
+
+        g6_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c2Lo g6_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c2Lo g6_d1Lo)
+                        (Bitwise.complement g6_c1Lo)
+                    )
+                )
+
+        g6_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c2Hi + g6_d1Hi + g6_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g6_b1xHi =
+            Bitwise.xor g3_b2Hi g6_c1Hi
+
+        g6_b1xLo =
+            Bitwise.xor g3_b2Lo g6_c1Lo
+
+        g6_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xHi) (Bitwise.shiftLeftBy 8 g6_b1xLo)
+
+        g6_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xLo) (Bitwise.shiftLeftBy 8 g6_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g6_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1Lo + g6_b1Lo)
+
+        g6_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1Lo g6_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1Lo g6_b1Lo)
+                        (Bitwise.complement g6_a1b1Lo)
+                    )
+                )
+
+        g6_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1Hi + g6_b1Hi + g6_a1b1Carry)
+
+        g6_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Lo + mb.m0.lo)
+
+        g6_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1b1Lo mb.m0.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1b1Lo mb.m0.lo)
+                        (Bitwise.complement g6_a2Lo)
+                    )
+                )
+
+        g6_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Hi + mb.m0.hi + g6_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g6_d2xHi =
+            Bitwise.xor g6_d1Hi g6_a2Hi
+
+        g6_d2xLo =
+            Bitwise.xor g6_d1Lo g6_a2Lo
+
+        g6_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xHi) (Bitwise.shiftLeftBy 16 g6_d2xLo)
+
+        g6_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xLo) (Bitwise.shiftLeftBy 16 g6_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g6_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_c1Lo + g6_d2Lo)
+
+        g6_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_c1Lo g6_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_c1Lo g6_d2Lo)
+                        (Bitwise.complement g6_c2Lo)
+                    )
+                )
+
+        g6_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_c1Hi + g6_d2Hi + g6_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g6_b2xHi =
+            Bitwise.xor g6_b1Hi g6_c2Hi
+
+        g6_b2xLo =
+            Bitwise.xor g6_b1Lo g6_c2Lo
+
+        g6_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xHi) (Bitwise.shiftRightZfBy 31 g6_b2xLo)
+
+        g6_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xLo) (Bitwise.shiftRightZfBy 31 g6_b2xHi)
+
+        -- Diagonal G7: a=g3.a, b=g0.b, c=g1.c, d=g2.d, x=m15, y=m8
+        -- a1 = add64(add64(a, b), x)
+        g7_abLo =
+            Bitwise.shiftRightZfBy 0 (g3_a2Lo + g0_b2Lo)
+
+        g7_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a2Lo g0_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a2Lo g0_b2Lo)
+                        (Bitwise.complement g7_abLo)
+                    )
+                )
+
+        g7_abHi =
+            Bitwise.shiftRightZfBy 0 (g3_a2Hi + g0_b2Hi + g7_abCarry)
+
+        g7_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_abLo + mb.m15.lo)
+
+        g7_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_abLo mb.m15.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_abLo mb.m15.lo)
+                        (Bitwise.complement g7_a1Lo)
+                    )
+                )
+
+        g7_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_abHi + mb.m15.hi + g7_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g7_d1Hi =
+            Bitwise.xor g2_d2Lo g7_a1Lo
+
+        g7_d1Lo =
+            Bitwise.xor g2_d2Hi g7_a1Hi
+
+        -- c1 = add64(c, d1)
+        g7_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c2Lo + g7_d1Lo)
+
+        g7_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c2Lo g7_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c2Lo g7_d1Lo)
+                        (Bitwise.complement g7_c1Lo)
+                    )
+                )
+
+        g7_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c2Hi + g7_d1Hi + g7_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g7_b1xHi =
+            Bitwise.xor g0_b2Hi g7_c1Hi
+
+        g7_b1xLo =
+            Bitwise.xor g0_b2Lo g7_c1Lo
+
+        g7_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xHi) (Bitwise.shiftLeftBy 8 g7_b1xLo)
+
+        g7_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xLo) (Bitwise.shiftLeftBy 8 g7_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g7_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1Lo + g7_b1Lo)
+
+        g7_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1Lo g7_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1Lo g7_b1Lo)
+                        (Bitwise.complement g7_a1b1Lo)
+                    )
+                )
+
+        g7_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1Hi + g7_b1Hi + g7_a1b1Carry)
+
+        g7_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Lo + mb.m8.lo)
+
+        g7_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1b1Lo mb.m8.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1b1Lo mb.m8.lo)
+                        (Bitwise.complement g7_a2Lo)
+                    )
+                )
+
+        g7_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Hi + mb.m8.hi + g7_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g7_d2xHi =
+            Bitwise.xor g7_d1Hi g7_a2Hi
+
+        g7_d2xLo =
+            Bitwise.xor g7_d1Lo g7_a2Lo
+
+        g7_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xHi) (Bitwise.shiftLeftBy 16 g7_d2xLo)
+
+        g7_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xLo) (Bitwise.shiftLeftBy 16 g7_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g7_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_c1Lo + g7_d2Lo)
+
+        g7_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_c1Lo g7_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_c1Lo g7_d2Lo)
+                        (Bitwise.complement g7_c2Lo)
+                    )
+                )
+
+        g7_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_c1Hi + g7_d2Hi + g7_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g7_b2xHi =
+            Bitwise.xor g7_b1Hi g7_c2Hi
+
+        g7_b2xLo =
+            Bitwise.xor g7_b1Lo g7_c2Lo
+
+        g7_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xHi) (Bitwise.shiftRightZfBy 31 g7_b2xLo)
+
+        g7_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
+
     in
-    { v0 = g4.a
-    , v1 = g5.a
-    , v2 = g6.a
-    , v3 = g7.a
-    , v4 = g7.b
-    , v5 = g4.b
-    , v6 = g5.b
-    , v7 = g6.b
-    , v8 = g6.c
-    , v9 = g7.c
-    , v10 = g4.c
-    , v11 = g5.c
-    , v12 = g5.d
-    , v13 = g6.d
-    , v14 = g7.d
-    , v15 = g4.d
+    { v0 = { hi = g4_a2Hi, lo = g4_a2Lo }
+    , v1 = { hi = g5_a2Hi, lo = g5_a2Lo }
+    , v2 = { hi = g6_a2Hi, lo = g6_a2Lo }
+    , v3 = { hi = g7_a2Hi, lo = g7_a2Lo }
+    , v4 = { hi = g7_b2Hi, lo = g7_b2Lo }
+    , v5 = { hi = g4_b2Hi, lo = g4_b2Lo }
+    , v6 = { hi = g5_b2Hi, lo = g5_b2Lo }
+    , v7 = { hi = g6_b2Hi, lo = g6_b2Lo }
+    , v8 = { hi = g6_c2Hi, lo = g6_c2Lo }
+    , v9 = { hi = g7_c2Hi, lo = g7_c2Lo }
+    , v10 = { hi = g4_c2Hi, lo = g4_c2Lo }
+    , v11 = { hi = g5_c2Hi, lo = g5_c2Lo }
+    , v12 = { hi = g5_d2Hi, lo = g5_d2Lo }
+    , v13 = { hi = g6_d2Hi, lo = g6_d2Lo }
+    , v14 = { hi = g7_d2Hi, lo = g7_d2Lo }
+    , v15 = { hi = g4_d2Hi, lo = g4_d2Lo }
     }
 
 
@@ -441,46 +4972,1199 @@ round3 mb v =
 round4 : U64MessageBlock -> WorkingVector -> WorkingVector
 round4 mb v =
     let
-        g0 =
-            g v.v0 v.v4 v.v8 v.v12 mb.m9 mb.m0
+        -- Column G0: a=v0, b=v4, c=v8, d=v12, x=m9, y=m0
+        -- a1 = add64(add64(a, b), x)
+        g0_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v0.lo + v.v4.lo)
 
-        g1 =
-            g v.v1 v.v5 v.v9 v.v13 mb.m5 mb.m7
+        g0_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v0.lo v.v4.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v0.lo v.v4.lo)
+                        (Bitwise.complement g0_abLo)
+                    )
+                )
 
-        g2 =
-            g v.v2 v.v6 v.v10 v.v14 mb.m2 mb.m4
+        g0_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v0.hi + v.v4.hi + g0_abCarry)
 
-        g3 =
-            g v.v3 v.v7 v.v11 v.v15 mb.m10 mb.m15
+        g0_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_abLo + mb.m9.lo)
 
-        g4 =
-            g g0.a g1.b g2.c g3.d mb.m14 mb.m1
+        g0_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_abLo mb.m9.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_abLo mb.m9.lo)
+                        (Bitwise.complement g0_a1Lo)
+                    )
+                )
 
-        g5 =
-            g g1.a g2.b g3.c g0.d mb.m11 mb.m12
+        g0_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_abHi + mb.m9.hi + g0_a1Carry)
 
-        g6 =
-            g g2.a g3.b g0.c g1.d mb.m6 mb.m8
+        -- d1 = rotr32(xor64(d, a1))
+        g0_d1Hi =
+            Bitwise.xor v.v12.lo g0_a1Lo
 
-        g7 =
-            g g3.a g0.b g1.c g2.d mb.m3 mb.m13
+        g0_d1Lo =
+            Bitwise.xor v.v12.hi g0_a1Hi
+
+        -- c1 = add64(c, d1)
+        g0_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v8.lo + g0_d1Lo)
+
+        g0_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v8.lo g0_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v8.lo g0_d1Lo)
+                        (Bitwise.complement g0_c1Lo)
+                    )
+                )
+
+        g0_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v8.hi + g0_d1Hi + g0_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g0_b1xHi =
+            Bitwise.xor v.v4.hi g0_c1Hi
+
+        g0_b1xLo =
+            Bitwise.xor v.v4.lo g0_c1Lo
+
+        g0_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xHi) (Bitwise.shiftLeftBy 8 g0_b1xLo)
+
+        g0_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xLo) (Bitwise.shiftLeftBy 8 g0_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g0_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1Lo + g0_b1Lo)
+
+        g0_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1Lo g0_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1Lo g0_b1Lo)
+                        (Bitwise.complement g0_a1b1Lo)
+                    )
+                )
+
+        g0_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1Hi + g0_b1Hi + g0_a1b1Carry)
+
+        g0_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Lo + mb.m0.lo)
+
+        g0_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1b1Lo mb.m0.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1b1Lo mb.m0.lo)
+                        (Bitwise.complement g0_a2Lo)
+                    )
+                )
+
+        g0_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Hi + mb.m0.hi + g0_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g0_d2xHi =
+            Bitwise.xor g0_d1Hi g0_a2Hi
+
+        g0_d2xLo =
+            Bitwise.xor g0_d1Lo g0_a2Lo
+
+        g0_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xHi) (Bitwise.shiftLeftBy 16 g0_d2xLo)
+
+        g0_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xLo) (Bitwise.shiftLeftBy 16 g0_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g0_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c1Lo + g0_d2Lo)
+
+        g0_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c1Lo g0_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c1Lo g0_d2Lo)
+                        (Bitwise.complement g0_c2Lo)
+                    )
+                )
+
+        g0_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c1Hi + g0_d2Hi + g0_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g0_b2xHi =
+            Bitwise.xor g0_b1Hi g0_c2Hi
+
+        g0_b2xLo =
+            Bitwise.xor g0_b1Lo g0_c2Lo
+
+        g0_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xHi) (Bitwise.shiftRightZfBy 31 g0_b2xLo)
+
+        g0_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xLo) (Bitwise.shiftRightZfBy 31 g0_b2xHi)
+
+        -- Column G1: a=v1, b=v5, c=v9, d=v13, x=m5, y=m7
+        -- a1 = add64(add64(a, b), x)
+        g1_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v1.lo + v.v5.lo)
+
+        g1_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v1.lo v.v5.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v1.lo v.v5.lo)
+                        (Bitwise.complement g1_abLo)
+                    )
+                )
+
+        g1_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v1.hi + v.v5.hi + g1_abCarry)
+
+        g1_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_abLo + mb.m5.lo)
+
+        g1_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_abLo mb.m5.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_abLo mb.m5.lo)
+                        (Bitwise.complement g1_a1Lo)
+                    )
+                )
+
+        g1_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_abHi + mb.m5.hi + g1_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g1_d1Hi =
+            Bitwise.xor v.v13.lo g1_a1Lo
+
+        g1_d1Lo =
+            Bitwise.xor v.v13.hi g1_a1Hi
+
+        -- c1 = add64(c, d1)
+        g1_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v9.lo + g1_d1Lo)
+
+        g1_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v9.lo g1_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v9.lo g1_d1Lo)
+                        (Bitwise.complement g1_c1Lo)
+                    )
+                )
+
+        g1_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v9.hi + g1_d1Hi + g1_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g1_b1xHi =
+            Bitwise.xor v.v5.hi g1_c1Hi
+
+        g1_b1xLo =
+            Bitwise.xor v.v5.lo g1_c1Lo
+
+        g1_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xHi) (Bitwise.shiftLeftBy 8 g1_b1xLo)
+
+        g1_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xLo) (Bitwise.shiftLeftBy 8 g1_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g1_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1Lo + g1_b1Lo)
+
+        g1_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1Lo g1_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1Lo g1_b1Lo)
+                        (Bitwise.complement g1_a1b1Lo)
+                    )
+                )
+
+        g1_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1Hi + g1_b1Hi + g1_a1b1Carry)
+
+        g1_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Lo + mb.m7.lo)
+
+        g1_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1b1Lo mb.m7.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1b1Lo mb.m7.lo)
+                        (Bitwise.complement g1_a2Lo)
+                    )
+                )
+
+        g1_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Hi + mb.m7.hi + g1_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g1_d2xHi =
+            Bitwise.xor g1_d1Hi g1_a2Hi
+
+        g1_d2xLo =
+            Bitwise.xor g1_d1Lo g1_a2Lo
+
+        g1_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xHi) (Bitwise.shiftLeftBy 16 g1_d2xLo)
+
+        g1_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xLo) (Bitwise.shiftLeftBy 16 g1_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g1_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c1Lo + g1_d2Lo)
+
+        g1_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c1Lo g1_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c1Lo g1_d2Lo)
+                        (Bitwise.complement g1_c2Lo)
+                    )
+                )
+
+        g1_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c1Hi + g1_d2Hi + g1_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g1_b2xHi =
+            Bitwise.xor g1_b1Hi g1_c2Hi
+
+        g1_b2xLo =
+            Bitwise.xor g1_b1Lo g1_c2Lo
+
+        g1_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xHi) (Bitwise.shiftRightZfBy 31 g1_b2xLo)
+
+        g1_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xLo) (Bitwise.shiftRightZfBy 31 g1_b2xHi)
+
+        -- Column G2: a=v2, b=v6, c=v10, d=v14, x=m2, y=m4
+        -- a1 = add64(add64(a, b), x)
+        g2_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v2.lo + v.v6.lo)
+
+        g2_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v2.lo v.v6.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v2.lo v.v6.lo)
+                        (Bitwise.complement g2_abLo)
+                    )
+                )
+
+        g2_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v2.hi + v.v6.hi + g2_abCarry)
+
+        g2_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_abLo + mb.m2.lo)
+
+        g2_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_abLo mb.m2.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_abLo mb.m2.lo)
+                        (Bitwise.complement g2_a1Lo)
+                    )
+                )
+
+        g2_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_abHi + mb.m2.hi + g2_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g2_d1Hi =
+            Bitwise.xor v.v14.lo g2_a1Lo
+
+        g2_d1Lo =
+            Bitwise.xor v.v14.hi g2_a1Hi
+
+        -- c1 = add64(c, d1)
+        g2_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v10.lo + g2_d1Lo)
+
+        g2_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v10.lo g2_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v10.lo g2_d1Lo)
+                        (Bitwise.complement g2_c1Lo)
+                    )
+                )
+
+        g2_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v10.hi + g2_d1Hi + g2_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g2_b1xHi =
+            Bitwise.xor v.v6.hi g2_c1Hi
+
+        g2_b1xLo =
+            Bitwise.xor v.v6.lo g2_c1Lo
+
+        g2_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xHi) (Bitwise.shiftLeftBy 8 g2_b1xLo)
+
+        g2_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xLo) (Bitwise.shiftLeftBy 8 g2_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g2_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1Lo + g2_b1Lo)
+
+        g2_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1Lo g2_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1Lo g2_b1Lo)
+                        (Bitwise.complement g2_a1b1Lo)
+                    )
+                )
+
+        g2_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1Hi + g2_b1Hi + g2_a1b1Carry)
+
+        g2_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Lo + mb.m4.lo)
+
+        g2_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1b1Lo mb.m4.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1b1Lo mb.m4.lo)
+                        (Bitwise.complement g2_a2Lo)
+                    )
+                )
+
+        g2_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Hi + mb.m4.hi + g2_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g2_d2xHi =
+            Bitwise.xor g2_d1Hi g2_a2Hi
+
+        g2_d2xLo =
+            Bitwise.xor g2_d1Lo g2_a2Lo
+
+        g2_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xHi) (Bitwise.shiftLeftBy 16 g2_d2xLo)
+
+        g2_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xLo) (Bitwise.shiftLeftBy 16 g2_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g2_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c1Lo + g2_d2Lo)
+
+        g2_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c1Lo g2_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c1Lo g2_d2Lo)
+                        (Bitwise.complement g2_c2Lo)
+                    )
+                )
+
+        g2_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c1Hi + g2_d2Hi + g2_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g2_b2xHi =
+            Bitwise.xor g2_b1Hi g2_c2Hi
+
+        g2_b2xLo =
+            Bitwise.xor g2_b1Lo g2_c2Lo
+
+        g2_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xHi) (Bitwise.shiftRightZfBy 31 g2_b2xLo)
+
+        g2_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xLo) (Bitwise.shiftRightZfBy 31 g2_b2xHi)
+
+        -- Column G3: a=v3, b=v7, c=v11, d=v15, x=m10, y=m15
+        -- a1 = add64(add64(a, b), x)
+        g3_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v3.lo + v.v7.lo)
+
+        g3_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v3.lo v.v7.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v3.lo v.v7.lo)
+                        (Bitwise.complement g3_abLo)
+                    )
+                )
+
+        g3_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v3.hi + v.v7.hi + g3_abCarry)
+
+        g3_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_abLo + mb.m10.lo)
+
+        g3_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_abLo mb.m10.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_abLo mb.m10.lo)
+                        (Bitwise.complement g3_a1Lo)
+                    )
+                )
+
+        g3_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_abHi + mb.m10.hi + g3_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g3_d1Hi =
+            Bitwise.xor v.v15.lo g3_a1Lo
+
+        g3_d1Lo =
+            Bitwise.xor v.v15.hi g3_a1Hi
+
+        -- c1 = add64(c, d1)
+        g3_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v11.lo + g3_d1Lo)
+
+        g3_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v11.lo g3_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v11.lo g3_d1Lo)
+                        (Bitwise.complement g3_c1Lo)
+                    )
+                )
+
+        g3_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v11.hi + g3_d1Hi + g3_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g3_b1xHi =
+            Bitwise.xor v.v7.hi g3_c1Hi
+
+        g3_b1xLo =
+            Bitwise.xor v.v7.lo g3_c1Lo
+
+        g3_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xHi) (Bitwise.shiftLeftBy 8 g3_b1xLo)
+
+        g3_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xLo) (Bitwise.shiftLeftBy 8 g3_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g3_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1Lo + g3_b1Lo)
+
+        g3_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1Lo g3_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1Lo g3_b1Lo)
+                        (Bitwise.complement g3_a1b1Lo)
+                    )
+                )
+
+        g3_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1Hi + g3_b1Hi + g3_a1b1Carry)
+
+        g3_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Lo + mb.m15.lo)
+
+        g3_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1b1Lo mb.m15.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1b1Lo mb.m15.lo)
+                        (Bitwise.complement g3_a2Lo)
+                    )
+                )
+
+        g3_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Hi + mb.m15.hi + g3_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g3_d2xHi =
+            Bitwise.xor g3_d1Hi g3_a2Hi
+
+        g3_d2xLo =
+            Bitwise.xor g3_d1Lo g3_a2Lo
+
+        g3_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xHi) (Bitwise.shiftLeftBy 16 g3_d2xLo)
+
+        g3_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xLo) (Bitwise.shiftLeftBy 16 g3_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g3_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c1Lo + g3_d2Lo)
+
+        g3_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c1Lo g3_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c1Lo g3_d2Lo)
+                        (Bitwise.complement g3_c2Lo)
+                    )
+                )
+
+        g3_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c1Hi + g3_d2Hi + g3_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g3_b2xHi =
+            Bitwise.xor g3_b1Hi g3_c2Hi
+
+        g3_b2xLo =
+            Bitwise.xor g3_b1Lo g3_c2Lo
+
+        g3_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xHi) (Bitwise.shiftRightZfBy 31 g3_b2xLo)
+
+        g3_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xLo) (Bitwise.shiftRightZfBy 31 g3_b2xHi)
+
+        -- Diagonal G4: a=g0.a, b=g1.b, c=g2.c, d=g3.d, x=m14, y=m1
+        -- a1 = add64(add64(a, b), x)
+        g4_abLo =
+            Bitwise.shiftRightZfBy 0 (g0_a2Lo + g1_b2Lo)
+
+        g4_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a2Lo g1_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a2Lo g1_b2Lo)
+                        (Bitwise.complement g4_abLo)
+                    )
+                )
+
+        g4_abHi =
+            Bitwise.shiftRightZfBy 0 (g0_a2Hi + g1_b2Hi + g4_abCarry)
+
+        g4_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_abLo + mb.m14.lo)
+
+        g4_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_abLo mb.m14.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_abLo mb.m14.lo)
+                        (Bitwise.complement g4_a1Lo)
+                    )
+                )
+
+        g4_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_abHi + mb.m14.hi + g4_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g4_d1Hi =
+            Bitwise.xor g3_d2Lo g4_a1Lo
+
+        g4_d1Lo =
+            Bitwise.xor g3_d2Hi g4_a1Hi
+
+        -- c1 = add64(c, d1)
+        g4_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c2Lo + g4_d1Lo)
+
+        g4_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c2Lo g4_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c2Lo g4_d1Lo)
+                        (Bitwise.complement g4_c1Lo)
+                    )
+                )
+
+        g4_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c2Hi + g4_d1Hi + g4_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g4_b1xHi =
+            Bitwise.xor g1_b2Hi g4_c1Hi
+
+        g4_b1xLo =
+            Bitwise.xor g1_b2Lo g4_c1Lo
+
+        g4_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xHi) (Bitwise.shiftLeftBy 8 g4_b1xLo)
+
+        g4_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xLo) (Bitwise.shiftLeftBy 8 g4_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g4_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1Lo + g4_b1Lo)
+
+        g4_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1Lo g4_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1Lo g4_b1Lo)
+                        (Bitwise.complement g4_a1b1Lo)
+                    )
+                )
+
+        g4_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1Hi + g4_b1Hi + g4_a1b1Carry)
+
+        g4_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Lo + mb.m1.lo)
+
+        g4_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1b1Lo mb.m1.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1b1Lo mb.m1.lo)
+                        (Bitwise.complement g4_a2Lo)
+                    )
+                )
+
+        g4_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Hi + mb.m1.hi + g4_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g4_d2xHi =
+            Bitwise.xor g4_d1Hi g4_a2Hi
+
+        g4_d2xLo =
+            Bitwise.xor g4_d1Lo g4_a2Lo
+
+        g4_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xHi) (Bitwise.shiftLeftBy 16 g4_d2xLo)
+
+        g4_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xLo) (Bitwise.shiftLeftBy 16 g4_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g4_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_c1Lo + g4_d2Lo)
+
+        g4_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_c1Lo g4_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_c1Lo g4_d2Lo)
+                        (Bitwise.complement g4_c2Lo)
+                    )
+                )
+
+        g4_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_c1Hi + g4_d2Hi + g4_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g4_b2xHi =
+            Bitwise.xor g4_b1Hi g4_c2Hi
+
+        g4_b2xLo =
+            Bitwise.xor g4_b1Lo g4_c2Lo
+
+        g4_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xHi) (Bitwise.shiftRightZfBy 31 g4_b2xLo)
+
+        g4_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xLo) (Bitwise.shiftRightZfBy 31 g4_b2xHi)
+
+        -- Diagonal G5: a=g1.a, b=g2.b, c=g3.c, d=g0.d, x=m11, y=m12
+        -- a1 = add64(add64(a, b), x)
+        g5_abLo =
+            Bitwise.shiftRightZfBy 0 (g1_a2Lo + g2_b2Lo)
+
+        g5_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a2Lo g2_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a2Lo g2_b2Lo)
+                        (Bitwise.complement g5_abLo)
+                    )
+                )
+
+        g5_abHi =
+            Bitwise.shiftRightZfBy 0 (g1_a2Hi + g2_b2Hi + g5_abCarry)
+
+        g5_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_abLo + mb.m11.lo)
+
+        g5_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_abLo mb.m11.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_abLo mb.m11.lo)
+                        (Bitwise.complement g5_a1Lo)
+                    )
+                )
+
+        g5_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_abHi + mb.m11.hi + g5_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g5_d1Hi =
+            Bitwise.xor g0_d2Lo g5_a1Lo
+
+        g5_d1Lo =
+            Bitwise.xor g0_d2Hi g5_a1Hi
+
+        -- c1 = add64(c, d1)
+        g5_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c2Lo + g5_d1Lo)
+
+        g5_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c2Lo g5_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c2Lo g5_d1Lo)
+                        (Bitwise.complement g5_c1Lo)
+                    )
+                )
+
+        g5_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c2Hi + g5_d1Hi + g5_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g5_b1xHi =
+            Bitwise.xor g2_b2Hi g5_c1Hi
+
+        g5_b1xLo =
+            Bitwise.xor g2_b2Lo g5_c1Lo
+
+        g5_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xHi) (Bitwise.shiftLeftBy 8 g5_b1xLo)
+
+        g5_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xLo) (Bitwise.shiftLeftBy 8 g5_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g5_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1Lo + g5_b1Lo)
+
+        g5_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1Lo g5_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1Lo g5_b1Lo)
+                        (Bitwise.complement g5_a1b1Lo)
+                    )
+                )
+
+        g5_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1Hi + g5_b1Hi + g5_a1b1Carry)
+
+        g5_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Lo + mb.m12.lo)
+
+        g5_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1b1Lo mb.m12.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1b1Lo mb.m12.lo)
+                        (Bitwise.complement g5_a2Lo)
+                    )
+                )
+
+        g5_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Hi + mb.m12.hi + g5_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g5_d2xHi =
+            Bitwise.xor g5_d1Hi g5_a2Hi
+
+        g5_d2xLo =
+            Bitwise.xor g5_d1Lo g5_a2Lo
+
+        g5_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xHi) (Bitwise.shiftLeftBy 16 g5_d2xLo)
+
+        g5_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xLo) (Bitwise.shiftLeftBy 16 g5_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g5_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_c1Lo + g5_d2Lo)
+
+        g5_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_c1Lo g5_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_c1Lo g5_d2Lo)
+                        (Bitwise.complement g5_c2Lo)
+                    )
+                )
+
+        g5_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_c1Hi + g5_d2Hi + g5_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g5_b2xHi =
+            Bitwise.xor g5_b1Hi g5_c2Hi
+
+        g5_b2xLo =
+            Bitwise.xor g5_b1Lo g5_c2Lo
+
+        g5_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xHi) (Bitwise.shiftRightZfBy 31 g5_b2xLo)
+
+        g5_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xLo) (Bitwise.shiftRightZfBy 31 g5_b2xHi)
+
+        -- Diagonal G6: a=g2.a, b=g3.b, c=g0.c, d=g1.d, x=m6, y=m8
+        -- a1 = add64(add64(a, b), x)
+        g6_abLo =
+            Bitwise.shiftRightZfBy 0 (g2_a2Lo + g3_b2Lo)
+
+        g6_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a2Lo g3_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a2Lo g3_b2Lo)
+                        (Bitwise.complement g6_abLo)
+                    )
+                )
+
+        g6_abHi =
+            Bitwise.shiftRightZfBy 0 (g2_a2Hi + g3_b2Hi + g6_abCarry)
+
+        g6_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_abLo + mb.m6.lo)
+
+        g6_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_abLo mb.m6.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_abLo mb.m6.lo)
+                        (Bitwise.complement g6_a1Lo)
+                    )
+                )
+
+        g6_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_abHi + mb.m6.hi + g6_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g6_d1Hi =
+            Bitwise.xor g1_d2Lo g6_a1Lo
+
+        g6_d1Lo =
+            Bitwise.xor g1_d2Hi g6_a1Hi
+
+        -- c1 = add64(c, d1)
+        g6_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c2Lo + g6_d1Lo)
+
+        g6_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c2Lo g6_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c2Lo g6_d1Lo)
+                        (Bitwise.complement g6_c1Lo)
+                    )
+                )
+
+        g6_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c2Hi + g6_d1Hi + g6_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g6_b1xHi =
+            Bitwise.xor g3_b2Hi g6_c1Hi
+
+        g6_b1xLo =
+            Bitwise.xor g3_b2Lo g6_c1Lo
+
+        g6_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xHi) (Bitwise.shiftLeftBy 8 g6_b1xLo)
+
+        g6_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xLo) (Bitwise.shiftLeftBy 8 g6_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g6_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1Lo + g6_b1Lo)
+
+        g6_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1Lo g6_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1Lo g6_b1Lo)
+                        (Bitwise.complement g6_a1b1Lo)
+                    )
+                )
+
+        g6_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1Hi + g6_b1Hi + g6_a1b1Carry)
+
+        g6_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Lo + mb.m8.lo)
+
+        g6_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1b1Lo mb.m8.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1b1Lo mb.m8.lo)
+                        (Bitwise.complement g6_a2Lo)
+                    )
+                )
+
+        g6_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Hi + mb.m8.hi + g6_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g6_d2xHi =
+            Bitwise.xor g6_d1Hi g6_a2Hi
+
+        g6_d2xLo =
+            Bitwise.xor g6_d1Lo g6_a2Lo
+
+        g6_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xHi) (Bitwise.shiftLeftBy 16 g6_d2xLo)
+
+        g6_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xLo) (Bitwise.shiftLeftBy 16 g6_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g6_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_c1Lo + g6_d2Lo)
+
+        g6_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_c1Lo g6_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_c1Lo g6_d2Lo)
+                        (Bitwise.complement g6_c2Lo)
+                    )
+                )
+
+        g6_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_c1Hi + g6_d2Hi + g6_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g6_b2xHi =
+            Bitwise.xor g6_b1Hi g6_c2Hi
+
+        g6_b2xLo =
+            Bitwise.xor g6_b1Lo g6_c2Lo
+
+        g6_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xHi) (Bitwise.shiftRightZfBy 31 g6_b2xLo)
+
+        g6_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xLo) (Bitwise.shiftRightZfBy 31 g6_b2xHi)
+
+        -- Diagonal G7: a=g3.a, b=g0.b, c=g1.c, d=g2.d, x=m3, y=m13
+        -- a1 = add64(add64(a, b), x)
+        g7_abLo =
+            Bitwise.shiftRightZfBy 0 (g3_a2Lo + g0_b2Lo)
+
+        g7_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a2Lo g0_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a2Lo g0_b2Lo)
+                        (Bitwise.complement g7_abLo)
+                    )
+                )
+
+        g7_abHi =
+            Bitwise.shiftRightZfBy 0 (g3_a2Hi + g0_b2Hi + g7_abCarry)
+
+        g7_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_abLo + mb.m3.lo)
+
+        g7_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_abLo mb.m3.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_abLo mb.m3.lo)
+                        (Bitwise.complement g7_a1Lo)
+                    )
+                )
+
+        g7_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_abHi + mb.m3.hi + g7_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g7_d1Hi =
+            Bitwise.xor g2_d2Lo g7_a1Lo
+
+        g7_d1Lo =
+            Bitwise.xor g2_d2Hi g7_a1Hi
+
+        -- c1 = add64(c, d1)
+        g7_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c2Lo + g7_d1Lo)
+
+        g7_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c2Lo g7_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c2Lo g7_d1Lo)
+                        (Bitwise.complement g7_c1Lo)
+                    )
+                )
+
+        g7_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c2Hi + g7_d1Hi + g7_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g7_b1xHi =
+            Bitwise.xor g0_b2Hi g7_c1Hi
+
+        g7_b1xLo =
+            Bitwise.xor g0_b2Lo g7_c1Lo
+
+        g7_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xHi) (Bitwise.shiftLeftBy 8 g7_b1xLo)
+
+        g7_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xLo) (Bitwise.shiftLeftBy 8 g7_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g7_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1Lo + g7_b1Lo)
+
+        g7_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1Lo g7_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1Lo g7_b1Lo)
+                        (Bitwise.complement g7_a1b1Lo)
+                    )
+                )
+
+        g7_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1Hi + g7_b1Hi + g7_a1b1Carry)
+
+        g7_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Lo + mb.m13.lo)
+
+        g7_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1b1Lo mb.m13.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1b1Lo mb.m13.lo)
+                        (Bitwise.complement g7_a2Lo)
+                    )
+                )
+
+        g7_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Hi + mb.m13.hi + g7_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g7_d2xHi =
+            Bitwise.xor g7_d1Hi g7_a2Hi
+
+        g7_d2xLo =
+            Bitwise.xor g7_d1Lo g7_a2Lo
+
+        g7_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xHi) (Bitwise.shiftLeftBy 16 g7_d2xLo)
+
+        g7_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xLo) (Bitwise.shiftLeftBy 16 g7_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g7_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_c1Lo + g7_d2Lo)
+
+        g7_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_c1Lo g7_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_c1Lo g7_d2Lo)
+                        (Bitwise.complement g7_c2Lo)
+                    )
+                )
+
+        g7_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_c1Hi + g7_d2Hi + g7_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g7_b2xHi =
+            Bitwise.xor g7_b1Hi g7_c2Hi
+
+        g7_b2xLo =
+            Bitwise.xor g7_b1Lo g7_c2Lo
+
+        g7_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xHi) (Bitwise.shiftRightZfBy 31 g7_b2xLo)
+
+        g7_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
+
     in
-    { v0 = g4.a
-    , v1 = g5.a
-    , v2 = g6.a
-    , v3 = g7.a
-    , v4 = g7.b
-    , v5 = g4.b
-    , v6 = g5.b
-    , v7 = g6.b
-    , v8 = g6.c
-    , v9 = g7.c
-    , v10 = g4.c
-    , v11 = g5.c
-    , v12 = g5.d
-    , v13 = g6.d
-    , v14 = g7.d
-    , v15 = g4.d
+    { v0 = { hi = g4_a2Hi, lo = g4_a2Lo }
+    , v1 = { hi = g5_a2Hi, lo = g5_a2Lo }
+    , v2 = { hi = g6_a2Hi, lo = g6_a2Lo }
+    , v3 = { hi = g7_a2Hi, lo = g7_a2Lo }
+    , v4 = { hi = g7_b2Hi, lo = g7_b2Lo }
+    , v5 = { hi = g4_b2Hi, lo = g4_b2Lo }
+    , v6 = { hi = g5_b2Hi, lo = g5_b2Lo }
+    , v7 = { hi = g6_b2Hi, lo = g6_b2Lo }
+    , v8 = { hi = g6_c2Hi, lo = g6_c2Lo }
+    , v9 = { hi = g7_c2Hi, lo = g7_c2Lo }
+    , v10 = { hi = g4_c2Hi, lo = g4_c2Lo }
+    , v11 = { hi = g5_c2Hi, lo = g5_c2Lo }
+    , v12 = { hi = g5_d2Hi, lo = g5_d2Lo }
+    , v13 = { hi = g6_d2Hi, lo = g6_d2Lo }
+    , v14 = { hi = g7_d2Hi, lo = g7_d2Lo }
+    , v15 = { hi = g4_d2Hi, lo = g4_d2Lo }
     }
 
 
@@ -489,46 +6173,1199 @@ round4 mb v =
 round5 : U64MessageBlock -> WorkingVector -> WorkingVector
 round5 mb v =
     let
-        g0 =
-            g v.v0 v.v4 v.v8 v.v12 mb.m2 mb.m12
+        -- Column G0: a=v0, b=v4, c=v8, d=v12, x=m2, y=m12
+        -- a1 = add64(add64(a, b), x)
+        g0_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v0.lo + v.v4.lo)
 
-        g1 =
-            g v.v1 v.v5 v.v9 v.v13 mb.m6 mb.m10
+        g0_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v0.lo v.v4.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v0.lo v.v4.lo)
+                        (Bitwise.complement g0_abLo)
+                    )
+                )
 
-        g2 =
-            g v.v2 v.v6 v.v10 v.v14 mb.m0 mb.m11
+        g0_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v0.hi + v.v4.hi + g0_abCarry)
 
-        g3 =
-            g v.v3 v.v7 v.v11 v.v15 mb.m8 mb.m3
+        g0_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_abLo + mb.m2.lo)
 
-        g4 =
-            g g0.a g1.b g2.c g3.d mb.m4 mb.m13
+        g0_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_abLo mb.m2.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_abLo mb.m2.lo)
+                        (Bitwise.complement g0_a1Lo)
+                    )
+                )
 
-        g5 =
-            g g1.a g2.b g3.c g0.d mb.m7 mb.m5
+        g0_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_abHi + mb.m2.hi + g0_a1Carry)
 
-        g6 =
-            g g2.a g3.b g0.c g1.d mb.m15 mb.m14
+        -- d1 = rotr32(xor64(d, a1))
+        g0_d1Hi =
+            Bitwise.xor v.v12.lo g0_a1Lo
 
-        g7 =
-            g g3.a g0.b g1.c g2.d mb.m1 mb.m9
+        g0_d1Lo =
+            Bitwise.xor v.v12.hi g0_a1Hi
+
+        -- c1 = add64(c, d1)
+        g0_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v8.lo + g0_d1Lo)
+
+        g0_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v8.lo g0_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v8.lo g0_d1Lo)
+                        (Bitwise.complement g0_c1Lo)
+                    )
+                )
+
+        g0_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v8.hi + g0_d1Hi + g0_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g0_b1xHi =
+            Bitwise.xor v.v4.hi g0_c1Hi
+
+        g0_b1xLo =
+            Bitwise.xor v.v4.lo g0_c1Lo
+
+        g0_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xHi) (Bitwise.shiftLeftBy 8 g0_b1xLo)
+
+        g0_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xLo) (Bitwise.shiftLeftBy 8 g0_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g0_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1Lo + g0_b1Lo)
+
+        g0_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1Lo g0_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1Lo g0_b1Lo)
+                        (Bitwise.complement g0_a1b1Lo)
+                    )
+                )
+
+        g0_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1Hi + g0_b1Hi + g0_a1b1Carry)
+
+        g0_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Lo + mb.m12.lo)
+
+        g0_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1b1Lo mb.m12.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1b1Lo mb.m12.lo)
+                        (Bitwise.complement g0_a2Lo)
+                    )
+                )
+
+        g0_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Hi + mb.m12.hi + g0_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g0_d2xHi =
+            Bitwise.xor g0_d1Hi g0_a2Hi
+
+        g0_d2xLo =
+            Bitwise.xor g0_d1Lo g0_a2Lo
+
+        g0_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xHi) (Bitwise.shiftLeftBy 16 g0_d2xLo)
+
+        g0_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xLo) (Bitwise.shiftLeftBy 16 g0_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g0_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c1Lo + g0_d2Lo)
+
+        g0_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c1Lo g0_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c1Lo g0_d2Lo)
+                        (Bitwise.complement g0_c2Lo)
+                    )
+                )
+
+        g0_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c1Hi + g0_d2Hi + g0_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g0_b2xHi =
+            Bitwise.xor g0_b1Hi g0_c2Hi
+
+        g0_b2xLo =
+            Bitwise.xor g0_b1Lo g0_c2Lo
+
+        g0_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xHi) (Bitwise.shiftRightZfBy 31 g0_b2xLo)
+
+        g0_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xLo) (Bitwise.shiftRightZfBy 31 g0_b2xHi)
+
+        -- Column G1: a=v1, b=v5, c=v9, d=v13, x=m6, y=m10
+        -- a1 = add64(add64(a, b), x)
+        g1_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v1.lo + v.v5.lo)
+
+        g1_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v1.lo v.v5.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v1.lo v.v5.lo)
+                        (Bitwise.complement g1_abLo)
+                    )
+                )
+
+        g1_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v1.hi + v.v5.hi + g1_abCarry)
+
+        g1_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_abLo + mb.m6.lo)
+
+        g1_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_abLo mb.m6.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_abLo mb.m6.lo)
+                        (Bitwise.complement g1_a1Lo)
+                    )
+                )
+
+        g1_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_abHi + mb.m6.hi + g1_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g1_d1Hi =
+            Bitwise.xor v.v13.lo g1_a1Lo
+
+        g1_d1Lo =
+            Bitwise.xor v.v13.hi g1_a1Hi
+
+        -- c1 = add64(c, d1)
+        g1_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v9.lo + g1_d1Lo)
+
+        g1_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v9.lo g1_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v9.lo g1_d1Lo)
+                        (Bitwise.complement g1_c1Lo)
+                    )
+                )
+
+        g1_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v9.hi + g1_d1Hi + g1_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g1_b1xHi =
+            Bitwise.xor v.v5.hi g1_c1Hi
+
+        g1_b1xLo =
+            Bitwise.xor v.v5.lo g1_c1Lo
+
+        g1_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xHi) (Bitwise.shiftLeftBy 8 g1_b1xLo)
+
+        g1_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xLo) (Bitwise.shiftLeftBy 8 g1_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g1_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1Lo + g1_b1Lo)
+
+        g1_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1Lo g1_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1Lo g1_b1Lo)
+                        (Bitwise.complement g1_a1b1Lo)
+                    )
+                )
+
+        g1_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1Hi + g1_b1Hi + g1_a1b1Carry)
+
+        g1_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Lo + mb.m10.lo)
+
+        g1_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1b1Lo mb.m10.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1b1Lo mb.m10.lo)
+                        (Bitwise.complement g1_a2Lo)
+                    )
+                )
+
+        g1_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Hi + mb.m10.hi + g1_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g1_d2xHi =
+            Bitwise.xor g1_d1Hi g1_a2Hi
+
+        g1_d2xLo =
+            Bitwise.xor g1_d1Lo g1_a2Lo
+
+        g1_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xHi) (Bitwise.shiftLeftBy 16 g1_d2xLo)
+
+        g1_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xLo) (Bitwise.shiftLeftBy 16 g1_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g1_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c1Lo + g1_d2Lo)
+
+        g1_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c1Lo g1_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c1Lo g1_d2Lo)
+                        (Bitwise.complement g1_c2Lo)
+                    )
+                )
+
+        g1_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c1Hi + g1_d2Hi + g1_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g1_b2xHi =
+            Bitwise.xor g1_b1Hi g1_c2Hi
+
+        g1_b2xLo =
+            Bitwise.xor g1_b1Lo g1_c2Lo
+
+        g1_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xHi) (Bitwise.shiftRightZfBy 31 g1_b2xLo)
+
+        g1_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xLo) (Bitwise.shiftRightZfBy 31 g1_b2xHi)
+
+        -- Column G2: a=v2, b=v6, c=v10, d=v14, x=m0, y=m11
+        -- a1 = add64(add64(a, b), x)
+        g2_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v2.lo + v.v6.lo)
+
+        g2_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v2.lo v.v6.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v2.lo v.v6.lo)
+                        (Bitwise.complement g2_abLo)
+                    )
+                )
+
+        g2_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v2.hi + v.v6.hi + g2_abCarry)
+
+        g2_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_abLo + mb.m0.lo)
+
+        g2_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_abLo mb.m0.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_abLo mb.m0.lo)
+                        (Bitwise.complement g2_a1Lo)
+                    )
+                )
+
+        g2_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_abHi + mb.m0.hi + g2_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g2_d1Hi =
+            Bitwise.xor v.v14.lo g2_a1Lo
+
+        g2_d1Lo =
+            Bitwise.xor v.v14.hi g2_a1Hi
+
+        -- c1 = add64(c, d1)
+        g2_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v10.lo + g2_d1Lo)
+
+        g2_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v10.lo g2_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v10.lo g2_d1Lo)
+                        (Bitwise.complement g2_c1Lo)
+                    )
+                )
+
+        g2_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v10.hi + g2_d1Hi + g2_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g2_b1xHi =
+            Bitwise.xor v.v6.hi g2_c1Hi
+
+        g2_b1xLo =
+            Bitwise.xor v.v6.lo g2_c1Lo
+
+        g2_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xHi) (Bitwise.shiftLeftBy 8 g2_b1xLo)
+
+        g2_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xLo) (Bitwise.shiftLeftBy 8 g2_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g2_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1Lo + g2_b1Lo)
+
+        g2_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1Lo g2_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1Lo g2_b1Lo)
+                        (Bitwise.complement g2_a1b1Lo)
+                    )
+                )
+
+        g2_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1Hi + g2_b1Hi + g2_a1b1Carry)
+
+        g2_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Lo + mb.m11.lo)
+
+        g2_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1b1Lo mb.m11.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1b1Lo mb.m11.lo)
+                        (Bitwise.complement g2_a2Lo)
+                    )
+                )
+
+        g2_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Hi + mb.m11.hi + g2_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g2_d2xHi =
+            Bitwise.xor g2_d1Hi g2_a2Hi
+
+        g2_d2xLo =
+            Bitwise.xor g2_d1Lo g2_a2Lo
+
+        g2_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xHi) (Bitwise.shiftLeftBy 16 g2_d2xLo)
+
+        g2_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xLo) (Bitwise.shiftLeftBy 16 g2_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g2_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c1Lo + g2_d2Lo)
+
+        g2_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c1Lo g2_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c1Lo g2_d2Lo)
+                        (Bitwise.complement g2_c2Lo)
+                    )
+                )
+
+        g2_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c1Hi + g2_d2Hi + g2_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g2_b2xHi =
+            Bitwise.xor g2_b1Hi g2_c2Hi
+
+        g2_b2xLo =
+            Bitwise.xor g2_b1Lo g2_c2Lo
+
+        g2_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xHi) (Bitwise.shiftRightZfBy 31 g2_b2xLo)
+
+        g2_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xLo) (Bitwise.shiftRightZfBy 31 g2_b2xHi)
+
+        -- Column G3: a=v3, b=v7, c=v11, d=v15, x=m8, y=m3
+        -- a1 = add64(add64(a, b), x)
+        g3_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v3.lo + v.v7.lo)
+
+        g3_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v3.lo v.v7.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v3.lo v.v7.lo)
+                        (Bitwise.complement g3_abLo)
+                    )
+                )
+
+        g3_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v3.hi + v.v7.hi + g3_abCarry)
+
+        g3_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_abLo + mb.m8.lo)
+
+        g3_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_abLo mb.m8.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_abLo mb.m8.lo)
+                        (Bitwise.complement g3_a1Lo)
+                    )
+                )
+
+        g3_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_abHi + mb.m8.hi + g3_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g3_d1Hi =
+            Bitwise.xor v.v15.lo g3_a1Lo
+
+        g3_d1Lo =
+            Bitwise.xor v.v15.hi g3_a1Hi
+
+        -- c1 = add64(c, d1)
+        g3_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v11.lo + g3_d1Lo)
+
+        g3_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v11.lo g3_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v11.lo g3_d1Lo)
+                        (Bitwise.complement g3_c1Lo)
+                    )
+                )
+
+        g3_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v11.hi + g3_d1Hi + g3_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g3_b1xHi =
+            Bitwise.xor v.v7.hi g3_c1Hi
+
+        g3_b1xLo =
+            Bitwise.xor v.v7.lo g3_c1Lo
+
+        g3_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xHi) (Bitwise.shiftLeftBy 8 g3_b1xLo)
+
+        g3_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xLo) (Bitwise.shiftLeftBy 8 g3_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g3_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1Lo + g3_b1Lo)
+
+        g3_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1Lo g3_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1Lo g3_b1Lo)
+                        (Bitwise.complement g3_a1b1Lo)
+                    )
+                )
+
+        g3_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1Hi + g3_b1Hi + g3_a1b1Carry)
+
+        g3_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Lo + mb.m3.lo)
+
+        g3_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1b1Lo mb.m3.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1b1Lo mb.m3.lo)
+                        (Bitwise.complement g3_a2Lo)
+                    )
+                )
+
+        g3_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Hi + mb.m3.hi + g3_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g3_d2xHi =
+            Bitwise.xor g3_d1Hi g3_a2Hi
+
+        g3_d2xLo =
+            Bitwise.xor g3_d1Lo g3_a2Lo
+
+        g3_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xHi) (Bitwise.shiftLeftBy 16 g3_d2xLo)
+
+        g3_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xLo) (Bitwise.shiftLeftBy 16 g3_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g3_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c1Lo + g3_d2Lo)
+
+        g3_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c1Lo g3_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c1Lo g3_d2Lo)
+                        (Bitwise.complement g3_c2Lo)
+                    )
+                )
+
+        g3_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c1Hi + g3_d2Hi + g3_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g3_b2xHi =
+            Bitwise.xor g3_b1Hi g3_c2Hi
+
+        g3_b2xLo =
+            Bitwise.xor g3_b1Lo g3_c2Lo
+
+        g3_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xHi) (Bitwise.shiftRightZfBy 31 g3_b2xLo)
+
+        g3_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xLo) (Bitwise.shiftRightZfBy 31 g3_b2xHi)
+
+        -- Diagonal G4: a=g0.a, b=g1.b, c=g2.c, d=g3.d, x=m4, y=m13
+        -- a1 = add64(add64(a, b), x)
+        g4_abLo =
+            Bitwise.shiftRightZfBy 0 (g0_a2Lo + g1_b2Lo)
+
+        g4_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a2Lo g1_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a2Lo g1_b2Lo)
+                        (Bitwise.complement g4_abLo)
+                    )
+                )
+
+        g4_abHi =
+            Bitwise.shiftRightZfBy 0 (g0_a2Hi + g1_b2Hi + g4_abCarry)
+
+        g4_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_abLo + mb.m4.lo)
+
+        g4_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_abLo mb.m4.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_abLo mb.m4.lo)
+                        (Bitwise.complement g4_a1Lo)
+                    )
+                )
+
+        g4_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_abHi + mb.m4.hi + g4_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g4_d1Hi =
+            Bitwise.xor g3_d2Lo g4_a1Lo
+
+        g4_d1Lo =
+            Bitwise.xor g3_d2Hi g4_a1Hi
+
+        -- c1 = add64(c, d1)
+        g4_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c2Lo + g4_d1Lo)
+
+        g4_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c2Lo g4_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c2Lo g4_d1Lo)
+                        (Bitwise.complement g4_c1Lo)
+                    )
+                )
+
+        g4_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c2Hi + g4_d1Hi + g4_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g4_b1xHi =
+            Bitwise.xor g1_b2Hi g4_c1Hi
+
+        g4_b1xLo =
+            Bitwise.xor g1_b2Lo g4_c1Lo
+
+        g4_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xHi) (Bitwise.shiftLeftBy 8 g4_b1xLo)
+
+        g4_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xLo) (Bitwise.shiftLeftBy 8 g4_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g4_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1Lo + g4_b1Lo)
+
+        g4_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1Lo g4_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1Lo g4_b1Lo)
+                        (Bitwise.complement g4_a1b1Lo)
+                    )
+                )
+
+        g4_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1Hi + g4_b1Hi + g4_a1b1Carry)
+
+        g4_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Lo + mb.m13.lo)
+
+        g4_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1b1Lo mb.m13.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1b1Lo mb.m13.lo)
+                        (Bitwise.complement g4_a2Lo)
+                    )
+                )
+
+        g4_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Hi + mb.m13.hi + g4_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g4_d2xHi =
+            Bitwise.xor g4_d1Hi g4_a2Hi
+
+        g4_d2xLo =
+            Bitwise.xor g4_d1Lo g4_a2Lo
+
+        g4_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xHi) (Bitwise.shiftLeftBy 16 g4_d2xLo)
+
+        g4_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xLo) (Bitwise.shiftLeftBy 16 g4_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g4_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_c1Lo + g4_d2Lo)
+
+        g4_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_c1Lo g4_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_c1Lo g4_d2Lo)
+                        (Bitwise.complement g4_c2Lo)
+                    )
+                )
+
+        g4_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_c1Hi + g4_d2Hi + g4_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g4_b2xHi =
+            Bitwise.xor g4_b1Hi g4_c2Hi
+
+        g4_b2xLo =
+            Bitwise.xor g4_b1Lo g4_c2Lo
+
+        g4_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xHi) (Bitwise.shiftRightZfBy 31 g4_b2xLo)
+
+        g4_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xLo) (Bitwise.shiftRightZfBy 31 g4_b2xHi)
+
+        -- Diagonal G5: a=g1.a, b=g2.b, c=g3.c, d=g0.d, x=m7, y=m5
+        -- a1 = add64(add64(a, b), x)
+        g5_abLo =
+            Bitwise.shiftRightZfBy 0 (g1_a2Lo + g2_b2Lo)
+
+        g5_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a2Lo g2_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a2Lo g2_b2Lo)
+                        (Bitwise.complement g5_abLo)
+                    )
+                )
+
+        g5_abHi =
+            Bitwise.shiftRightZfBy 0 (g1_a2Hi + g2_b2Hi + g5_abCarry)
+
+        g5_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_abLo + mb.m7.lo)
+
+        g5_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_abLo mb.m7.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_abLo mb.m7.lo)
+                        (Bitwise.complement g5_a1Lo)
+                    )
+                )
+
+        g5_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_abHi + mb.m7.hi + g5_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g5_d1Hi =
+            Bitwise.xor g0_d2Lo g5_a1Lo
+
+        g5_d1Lo =
+            Bitwise.xor g0_d2Hi g5_a1Hi
+
+        -- c1 = add64(c, d1)
+        g5_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c2Lo + g5_d1Lo)
+
+        g5_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c2Lo g5_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c2Lo g5_d1Lo)
+                        (Bitwise.complement g5_c1Lo)
+                    )
+                )
+
+        g5_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c2Hi + g5_d1Hi + g5_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g5_b1xHi =
+            Bitwise.xor g2_b2Hi g5_c1Hi
+
+        g5_b1xLo =
+            Bitwise.xor g2_b2Lo g5_c1Lo
+
+        g5_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xHi) (Bitwise.shiftLeftBy 8 g5_b1xLo)
+
+        g5_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xLo) (Bitwise.shiftLeftBy 8 g5_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g5_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1Lo + g5_b1Lo)
+
+        g5_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1Lo g5_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1Lo g5_b1Lo)
+                        (Bitwise.complement g5_a1b1Lo)
+                    )
+                )
+
+        g5_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1Hi + g5_b1Hi + g5_a1b1Carry)
+
+        g5_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Lo + mb.m5.lo)
+
+        g5_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1b1Lo mb.m5.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1b1Lo mb.m5.lo)
+                        (Bitwise.complement g5_a2Lo)
+                    )
+                )
+
+        g5_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Hi + mb.m5.hi + g5_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g5_d2xHi =
+            Bitwise.xor g5_d1Hi g5_a2Hi
+
+        g5_d2xLo =
+            Bitwise.xor g5_d1Lo g5_a2Lo
+
+        g5_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xHi) (Bitwise.shiftLeftBy 16 g5_d2xLo)
+
+        g5_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xLo) (Bitwise.shiftLeftBy 16 g5_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g5_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_c1Lo + g5_d2Lo)
+
+        g5_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_c1Lo g5_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_c1Lo g5_d2Lo)
+                        (Bitwise.complement g5_c2Lo)
+                    )
+                )
+
+        g5_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_c1Hi + g5_d2Hi + g5_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g5_b2xHi =
+            Bitwise.xor g5_b1Hi g5_c2Hi
+
+        g5_b2xLo =
+            Bitwise.xor g5_b1Lo g5_c2Lo
+
+        g5_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xHi) (Bitwise.shiftRightZfBy 31 g5_b2xLo)
+
+        g5_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xLo) (Bitwise.shiftRightZfBy 31 g5_b2xHi)
+
+        -- Diagonal G6: a=g2.a, b=g3.b, c=g0.c, d=g1.d, x=m15, y=m14
+        -- a1 = add64(add64(a, b), x)
+        g6_abLo =
+            Bitwise.shiftRightZfBy 0 (g2_a2Lo + g3_b2Lo)
+
+        g6_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a2Lo g3_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a2Lo g3_b2Lo)
+                        (Bitwise.complement g6_abLo)
+                    )
+                )
+
+        g6_abHi =
+            Bitwise.shiftRightZfBy 0 (g2_a2Hi + g3_b2Hi + g6_abCarry)
+
+        g6_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_abLo + mb.m15.lo)
+
+        g6_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_abLo mb.m15.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_abLo mb.m15.lo)
+                        (Bitwise.complement g6_a1Lo)
+                    )
+                )
+
+        g6_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_abHi + mb.m15.hi + g6_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g6_d1Hi =
+            Bitwise.xor g1_d2Lo g6_a1Lo
+
+        g6_d1Lo =
+            Bitwise.xor g1_d2Hi g6_a1Hi
+
+        -- c1 = add64(c, d1)
+        g6_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c2Lo + g6_d1Lo)
+
+        g6_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c2Lo g6_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c2Lo g6_d1Lo)
+                        (Bitwise.complement g6_c1Lo)
+                    )
+                )
+
+        g6_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c2Hi + g6_d1Hi + g6_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g6_b1xHi =
+            Bitwise.xor g3_b2Hi g6_c1Hi
+
+        g6_b1xLo =
+            Bitwise.xor g3_b2Lo g6_c1Lo
+
+        g6_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xHi) (Bitwise.shiftLeftBy 8 g6_b1xLo)
+
+        g6_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xLo) (Bitwise.shiftLeftBy 8 g6_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g6_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1Lo + g6_b1Lo)
+
+        g6_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1Lo g6_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1Lo g6_b1Lo)
+                        (Bitwise.complement g6_a1b1Lo)
+                    )
+                )
+
+        g6_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1Hi + g6_b1Hi + g6_a1b1Carry)
+
+        g6_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Lo + mb.m14.lo)
+
+        g6_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1b1Lo mb.m14.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1b1Lo mb.m14.lo)
+                        (Bitwise.complement g6_a2Lo)
+                    )
+                )
+
+        g6_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Hi + mb.m14.hi + g6_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g6_d2xHi =
+            Bitwise.xor g6_d1Hi g6_a2Hi
+
+        g6_d2xLo =
+            Bitwise.xor g6_d1Lo g6_a2Lo
+
+        g6_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xHi) (Bitwise.shiftLeftBy 16 g6_d2xLo)
+
+        g6_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xLo) (Bitwise.shiftLeftBy 16 g6_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g6_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_c1Lo + g6_d2Lo)
+
+        g6_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_c1Lo g6_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_c1Lo g6_d2Lo)
+                        (Bitwise.complement g6_c2Lo)
+                    )
+                )
+
+        g6_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_c1Hi + g6_d2Hi + g6_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g6_b2xHi =
+            Bitwise.xor g6_b1Hi g6_c2Hi
+
+        g6_b2xLo =
+            Bitwise.xor g6_b1Lo g6_c2Lo
+
+        g6_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xHi) (Bitwise.shiftRightZfBy 31 g6_b2xLo)
+
+        g6_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xLo) (Bitwise.shiftRightZfBy 31 g6_b2xHi)
+
+        -- Diagonal G7: a=g3.a, b=g0.b, c=g1.c, d=g2.d, x=m1, y=m9
+        -- a1 = add64(add64(a, b), x)
+        g7_abLo =
+            Bitwise.shiftRightZfBy 0 (g3_a2Lo + g0_b2Lo)
+
+        g7_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a2Lo g0_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a2Lo g0_b2Lo)
+                        (Bitwise.complement g7_abLo)
+                    )
+                )
+
+        g7_abHi =
+            Bitwise.shiftRightZfBy 0 (g3_a2Hi + g0_b2Hi + g7_abCarry)
+
+        g7_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_abLo + mb.m1.lo)
+
+        g7_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_abLo mb.m1.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_abLo mb.m1.lo)
+                        (Bitwise.complement g7_a1Lo)
+                    )
+                )
+
+        g7_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_abHi + mb.m1.hi + g7_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g7_d1Hi =
+            Bitwise.xor g2_d2Lo g7_a1Lo
+
+        g7_d1Lo =
+            Bitwise.xor g2_d2Hi g7_a1Hi
+
+        -- c1 = add64(c, d1)
+        g7_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c2Lo + g7_d1Lo)
+
+        g7_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c2Lo g7_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c2Lo g7_d1Lo)
+                        (Bitwise.complement g7_c1Lo)
+                    )
+                )
+
+        g7_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c2Hi + g7_d1Hi + g7_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g7_b1xHi =
+            Bitwise.xor g0_b2Hi g7_c1Hi
+
+        g7_b1xLo =
+            Bitwise.xor g0_b2Lo g7_c1Lo
+
+        g7_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xHi) (Bitwise.shiftLeftBy 8 g7_b1xLo)
+
+        g7_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xLo) (Bitwise.shiftLeftBy 8 g7_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g7_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1Lo + g7_b1Lo)
+
+        g7_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1Lo g7_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1Lo g7_b1Lo)
+                        (Bitwise.complement g7_a1b1Lo)
+                    )
+                )
+
+        g7_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1Hi + g7_b1Hi + g7_a1b1Carry)
+
+        g7_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Lo + mb.m9.lo)
+
+        g7_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1b1Lo mb.m9.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1b1Lo mb.m9.lo)
+                        (Bitwise.complement g7_a2Lo)
+                    )
+                )
+
+        g7_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Hi + mb.m9.hi + g7_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g7_d2xHi =
+            Bitwise.xor g7_d1Hi g7_a2Hi
+
+        g7_d2xLo =
+            Bitwise.xor g7_d1Lo g7_a2Lo
+
+        g7_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xHi) (Bitwise.shiftLeftBy 16 g7_d2xLo)
+
+        g7_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xLo) (Bitwise.shiftLeftBy 16 g7_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g7_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_c1Lo + g7_d2Lo)
+
+        g7_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_c1Lo g7_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_c1Lo g7_d2Lo)
+                        (Bitwise.complement g7_c2Lo)
+                    )
+                )
+
+        g7_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_c1Hi + g7_d2Hi + g7_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g7_b2xHi =
+            Bitwise.xor g7_b1Hi g7_c2Hi
+
+        g7_b2xLo =
+            Bitwise.xor g7_b1Lo g7_c2Lo
+
+        g7_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xHi) (Bitwise.shiftRightZfBy 31 g7_b2xLo)
+
+        g7_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
+
     in
-    { v0 = g4.a
-    , v1 = g5.a
-    , v2 = g6.a
-    , v3 = g7.a
-    , v4 = g7.b
-    , v5 = g4.b
-    , v6 = g5.b
-    , v7 = g6.b
-    , v8 = g6.c
-    , v9 = g7.c
-    , v10 = g4.c
-    , v11 = g5.c
-    , v12 = g5.d
-    , v13 = g6.d
-    , v14 = g7.d
-    , v15 = g4.d
+    { v0 = { hi = g4_a2Hi, lo = g4_a2Lo }
+    , v1 = { hi = g5_a2Hi, lo = g5_a2Lo }
+    , v2 = { hi = g6_a2Hi, lo = g6_a2Lo }
+    , v3 = { hi = g7_a2Hi, lo = g7_a2Lo }
+    , v4 = { hi = g7_b2Hi, lo = g7_b2Lo }
+    , v5 = { hi = g4_b2Hi, lo = g4_b2Lo }
+    , v6 = { hi = g5_b2Hi, lo = g5_b2Lo }
+    , v7 = { hi = g6_b2Hi, lo = g6_b2Lo }
+    , v8 = { hi = g6_c2Hi, lo = g6_c2Lo }
+    , v9 = { hi = g7_c2Hi, lo = g7_c2Lo }
+    , v10 = { hi = g4_c2Hi, lo = g4_c2Lo }
+    , v11 = { hi = g5_c2Hi, lo = g5_c2Lo }
+    , v12 = { hi = g5_d2Hi, lo = g5_d2Lo }
+    , v13 = { hi = g6_d2Hi, lo = g6_d2Lo }
+    , v14 = { hi = g7_d2Hi, lo = g7_d2Lo }
+    , v15 = { hi = g4_d2Hi, lo = g4_d2Lo }
     }
 
 
@@ -537,46 +7374,1199 @@ round5 mb v =
 round6 : U64MessageBlock -> WorkingVector -> WorkingVector
 round6 mb v =
     let
-        g0 =
-            g v.v0 v.v4 v.v8 v.v12 mb.m12 mb.m5
+        -- Column G0: a=v0, b=v4, c=v8, d=v12, x=m12, y=m5
+        -- a1 = add64(add64(a, b), x)
+        g0_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v0.lo + v.v4.lo)
 
-        g1 =
-            g v.v1 v.v5 v.v9 v.v13 mb.m1 mb.m15
+        g0_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v0.lo v.v4.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v0.lo v.v4.lo)
+                        (Bitwise.complement g0_abLo)
+                    )
+                )
 
-        g2 =
-            g v.v2 v.v6 v.v10 v.v14 mb.m14 mb.m13
+        g0_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v0.hi + v.v4.hi + g0_abCarry)
 
-        g3 =
-            g v.v3 v.v7 v.v11 v.v15 mb.m4 mb.m10
+        g0_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_abLo + mb.m12.lo)
 
-        g4 =
-            g g0.a g1.b g2.c g3.d mb.m0 mb.m7
+        g0_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_abLo mb.m12.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_abLo mb.m12.lo)
+                        (Bitwise.complement g0_a1Lo)
+                    )
+                )
 
-        g5 =
-            g g1.a g2.b g3.c g0.d mb.m6 mb.m3
+        g0_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_abHi + mb.m12.hi + g0_a1Carry)
 
-        g6 =
-            g g2.a g3.b g0.c g1.d mb.m9 mb.m2
+        -- d1 = rotr32(xor64(d, a1))
+        g0_d1Hi =
+            Bitwise.xor v.v12.lo g0_a1Lo
 
-        g7 =
-            g g3.a g0.b g1.c g2.d mb.m8 mb.m11
+        g0_d1Lo =
+            Bitwise.xor v.v12.hi g0_a1Hi
+
+        -- c1 = add64(c, d1)
+        g0_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v8.lo + g0_d1Lo)
+
+        g0_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v8.lo g0_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v8.lo g0_d1Lo)
+                        (Bitwise.complement g0_c1Lo)
+                    )
+                )
+
+        g0_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v8.hi + g0_d1Hi + g0_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g0_b1xHi =
+            Bitwise.xor v.v4.hi g0_c1Hi
+
+        g0_b1xLo =
+            Bitwise.xor v.v4.lo g0_c1Lo
+
+        g0_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xHi) (Bitwise.shiftLeftBy 8 g0_b1xLo)
+
+        g0_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xLo) (Bitwise.shiftLeftBy 8 g0_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g0_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1Lo + g0_b1Lo)
+
+        g0_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1Lo g0_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1Lo g0_b1Lo)
+                        (Bitwise.complement g0_a1b1Lo)
+                    )
+                )
+
+        g0_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1Hi + g0_b1Hi + g0_a1b1Carry)
+
+        g0_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Lo + mb.m5.lo)
+
+        g0_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1b1Lo mb.m5.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1b1Lo mb.m5.lo)
+                        (Bitwise.complement g0_a2Lo)
+                    )
+                )
+
+        g0_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Hi + mb.m5.hi + g0_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g0_d2xHi =
+            Bitwise.xor g0_d1Hi g0_a2Hi
+
+        g0_d2xLo =
+            Bitwise.xor g0_d1Lo g0_a2Lo
+
+        g0_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xHi) (Bitwise.shiftLeftBy 16 g0_d2xLo)
+
+        g0_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xLo) (Bitwise.shiftLeftBy 16 g0_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g0_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c1Lo + g0_d2Lo)
+
+        g0_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c1Lo g0_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c1Lo g0_d2Lo)
+                        (Bitwise.complement g0_c2Lo)
+                    )
+                )
+
+        g0_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c1Hi + g0_d2Hi + g0_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g0_b2xHi =
+            Bitwise.xor g0_b1Hi g0_c2Hi
+
+        g0_b2xLo =
+            Bitwise.xor g0_b1Lo g0_c2Lo
+
+        g0_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xHi) (Bitwise.shiftRightZfBy 31 g0_b2xLo)
+
+        g0_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xLo) (Bitwise.shiftRightZfBy 31 g0_b2xHi)
+
+        -- Column G1: a=v1, b=v5, c=v9, d=v13, x=m1, y=m15
+        -- a1 = add64(add64(a, b), x)
+        g1_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v1.lo + v.v5.lo)
+
+        g1_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v1.lo v.v5.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v1.lo v.v5.lo)
+                        (Bitwise.complement g1_abLo)
+                    )
+                )
+
+        g1_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v1.hi + v.v5.hi + g1_abCarry)
+
+        g1_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_abLo + mb.m1.lo)
+
+        g1_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_abLo mb.m1.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_abLo mb.m1.lo)
+                        (Bitwise.complement g1_a1Lo)
+                    )
+                )
+
+        g1_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_abHi + mb.m1.hi + g1_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g1_d1Hi =
+            Bitwise.xor v.v13.lo g1_a1Lo
+
+        g1_d1Lo =
+            Bitwise.xor v.v13.hi g1_a1Hi
+
+        -- c1 = add64(c, d1)
+        g1_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v9.lo + g1_d1Lo)
+
+        g1_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v9.lo g1_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v9.lo g1_d1Lo)
+                        (Bitwise.complement g1_c1Lo)
+                    )
+                )
+
+        g1_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v9.hi + g1_d1Hi + g1_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g1_b1xHi =
+            Bitwise.xor v.v5.hi g1_c1Hi
+
+        g1_b1xLo =
+            Bitwise.xor v.v5.lo g1_c1Lo
+
+        g1_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xHi) (Bitwise.shiftLeftBy 8 g1_b1xLo)
+
+        g1_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xLo) (Bitwise.shiftLeftBy 8 g1_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g1_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1Lo + g1_b1Lo)
+
+        g1_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1Lo g1_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1Lo g1_b1Lo)
+                        (Bitwise.complement g1_a1b1Lo)
+                    )
+                )
+
+        g1_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1Hi + g1_b1Hi + g1_a1b1Carry)
+
+        g1_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Lo + mb.m15.lo)
+
+        g1_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1b1Lo mb.m15.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1b1Lo mb.m15.lo)
+                        (Bitwise.complement g1_a2Lo)
+                    )
+                )
+
+        g1_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Hi + mb.m15.hi + g1_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g1_d2xHi =
+            Bitwise.xor g1_d1Hi g1_a2Hi
+
+        g1_d2xLo =
+            Bitwise.xor g1_d1Lo g1_a2Lo
+
+        g1_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xHi) (Bitwise.shiftLeftBy 16 g1_d2xLo)
+
+        g1_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xLo) (Bitwise.shiftLeftBy 16 g1_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g1_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c1Lo + g1_d2Lo)
+
+        g1_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c1Lo g1_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c1Lo g1_d2Lo)
+                        (Bitwise.complement g1_c2Lo)
+                    )
+                )
+
+        g1_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c1Hi + g1_d2Hi + g1_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g1_b2xHi =
+            Bitwise.xor g1_b1Hi g1_c2Hi
+
+        g1_b2xLo =
+            Bitwise.xor g1_b1Lo g1_c2Lo
+
+        g1_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xHi) (Bitwise.shiftRightZfBy 31 g1_b2xLo)
+
+        g1_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xLo) (Bitwise.shiftRightZfBy 31 g1_b2xHi)
+
+        -- Column G2: a=v2, b=v6, c=v10, d=v14, x=m14, y=m13
+        -- a1 = add64(add64(a, b), x)
+        g2_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v2.lo + v.v6.lo)
+
+        g2_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v2.lo v.v6.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v2.lo v.v6.lo)
+                        (Bitwise.complement g2_abLo)
+                    )
+                )
+
+        g2_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v2.hi + v.v6.hi + g2_abCarry)
+
+        g2_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_abLo + mb.m14.lo)
+
+        g2_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_abLo mb.m14.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_abLo mb.m14.lo)
+                        (Bitwise.complement g2_a1Lo)
+                    )
+                )
+
+        g2_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_abHi + mb.m14.hi + g2_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g2_d1Hi =
+            Bitwise.xor v.v14.lo g2_a1Lo
+
+        g2_d1Lo =
+            Bitwise.xor v.v14.hi g2_a1Hi
+
+        -- c1 = add64(c, d1)
+        g2_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v10.lo + g2_d1Lo)
+
+        g2_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v10.lo g2_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v10.lo g2_d1Lo)
+                        (Bitwise.complement g2_c1Lo)
+                    )
+                )
+
+        g2_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v10.hi + g2_d1Hi + g2_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g2_b1xHi =
+            Bitwise.xor v.v6.hi g2_c1Hi
+
+        g2_b1xLo =
+            Bitwise.xor v.v6.lo g2_c1Lo
+
+        g2_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xHi) (Bitwise.shiftLeftBy 8 g2_b1xLo)
+
+        g2_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xLo) (Bitwise.shiftLeftBy 8 g2_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g2_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1Lo + g2_b1Lo)
+
+        g2_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1Lo g2_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1Lo g2_b1Lo)
+                        (Bitwise.complement g2_a1b1Lo)
+                    )
+                )
+
+        g2_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1Hi + g2_b1Hi + g2_a1b1Carry)
+
+        g2_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Lo + mb.m13.lo)
+
+        g2_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1b1Lo mb.m13.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1b1Lo mb.m13.lo)
+                        (Bitwise.complement g2_a2Lo)
+                    )
+                )
+
+        g2_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Hi + mb.m13.hi + g2_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g2_d2xHi =
+            Bitwise.xor g2_d1Hi g2_a2Hi
+
+        g2_d2xLo =
+            Bitwise.xor g2_d1Lo g2_a2Lo
+
+        g2_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xHi) (Bitwise.shiftLeftBy 16 g2_d2xLo)
+
+        g2_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xLo) (Bitwise.shiftLeftBy 16 g2_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g2_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c1Lo + g2_d2Lo)
+
+        g2_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c1Lo g2_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c1Lo g2_d2Lo)
+                        (Bitwise.complement g2_c2Lo)
+                    )
+                )
+
+        g2_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c1Hi + g2_d2Hi + g2_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g2_b2xHi =
+            Bitwise.xor g2_b1Hi g2_c2Hi
+
+        g2_b2xLo =
+            Bitwise.xor g2_b1Lo g2_c2Lo
+
+        g2_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xHi) (Bitwise.shiftRightZfBy 31 g2_b2xLo)
+
+        g2_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xLo) (Bitwise.shiftRightZfBy 31 g2_b2xHi)
+
+        -- Column G3: a=v3, b=v7, c=v11, d=v15, x=m4, y=m10
+        -- a1 = add64(add64(a, b), x)
+        g3_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v3.lo + v.v7.lo)
+
+        g3_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v3.lo v.v7.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v3.lo v.v7.lo)
+                        (Bitwise.complement g3_abLo)
+                    )
+                )
+
+        g3_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v3.hi + v.v7.hi + g3_abCarry)
+
+        g3_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_abLo + mb.m4.lo)
+
+        g3_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_abLo mb.m4.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_abLo mb.m4.lo)
+                        (Bitwise.complement g3_a1Lo)
+                    )
+                )
+
+        g3_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_abHi + mb.m4.hi + g3_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g3_d1Hi =
+            Bitwise.xor v.v15.lo g3_a1Lo
+
+        g3_d1Lo =
+            Bitwise.xor v.v15.hi g3_a1Hi
+
+        -- c1 = add64(c, d1)
+        g3_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v11.lo + g3_d1Lo)
+
+        g3_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v11.lo g3_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v11.lo g3_d1Lo)
+                        (Bitwise.complement g3_c1Lo)
+                    )
+                )
+
+        g3_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v11.hi + g3_d1Hi + g3_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g3_b1xHi =
+            Bitwise.xor v.v7.hi g3_c1Hi
+
+        g3_b1xLo =
+            Bitwise.xor v.v7.lo g3_c1Lo
+
+        g3_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xHi) (Bitwise.shiftLeftBy 8 g3_b1xLo)
+
+        g3_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xLo) (Bitwise.shiftLeftBy 8 g3_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g3_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1Lo + g3_b1Lo)
+
+        g3_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1Lo g3_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1Lo g3_b1Lo)
+                        (Bitwise.complement g3_a1b1Lo)
+                    )
+                )
+
+        g3_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1Hi + g3_b1Hi + g3_a1b1Carry)
+
+        g3_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Lo + mb.m10.lo)
+
+        g3_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1b1Lo mb.m10.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1b1Lo mb.m10.lo)
+                        (Bitwise.complement g3_a2Lo)
+                    )
+                )
+
+        g3_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Hi + mb.m10.hi + g3_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g3_d2xHi =
+            Bitwise.xor g3_d1Hi g3_a2Hi
+
+        g3_d2xLo =
+            Bitwise.xor g3_d1Lo g3_a2Lo
+
+        g3_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xHi) (Bitwise.shiftLeftBy 16 g3_d2xLo)
+
+        g3_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xLo) (Bitwise.shiftLeftBy 16 g3_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g3_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c1Lo + g3_d2Lo)
+
+        g3_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c1Lo g3_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c1Lo g3_d2Lo)
+                        (Bitwise.complement g3_c2Lo)
+                    )
+                )
+
+        g3_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c1Hi + g3_d2Hi + g3_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g3_b2xHi =
+            Bitwise.xor g3_b1Hi g3_c2Hi
+
+        g3_b2xLo =
+            Bitwise.xor g3_b1Lo g3_c2Lo
+
+        g3_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xHi) (Bitwise.shiftRightZfBy 31 g3_b2xLo)
+
+        g3_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xLo) (Bitwise.shiftRightZfBy 31 g3_b2xHi)
+
+        -- Diagonal G4: a=g0.a, b=g1.b, c=g2.c, d=g3.d, x=m0, y=m7
+        -- a1 = add64(add64(a, b), x)
+        g4_abLo =
+            Bitwise.shiftRightZfBy 0 (g0_a2Lo + g1_b2Lo)
+
+        g4_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a2Lo g1_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a2Lo g1_b2Lo)
+                        (Bitwise.complement g4_abLo)
+                    )
+                )
+
+        g4_abHi =
+            Bitwise.shiftRightZfBy 0 (g0_a2Hi + g1_b2Hi + g4_abCarry)
+
+        g4_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_abLo + mb.m0.lo)
+
+        g4_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_abLo mb.m0.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_abLo mb.m0.lo)
+                        (Bitwise.complement g4_a1Lo)
+                    )
+                )
+
+        g4_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_abHi + mb.m0.hi + g4_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g4_d1Hi =
+            Bitwise.xor g3_d2Lo g4_a1Lo
+
+        g4_d1Lo =
+            Bitwise.xor g3_d2Hi g4_a1Hi
+
+        -- c1 = add64(c, d1)
+        g4_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c2Lo + g4_d1Lo)
+
+        g4_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c2Lo g4_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c2Lo g4_d1Lo)
+                        (Bitwise.complement g4_c1Lo)
+                    )
+                )
+
+        g4_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c2Hi + g4_d1Hi + g4_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g4_b1xHi =
+            Bitwise.xor g1_b2Hi g4_c1Hi
+
+        g4_b1xLo =
+            Bitwise.xor g1_b2Lo g4_c1Lo
+
+        g4_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xHi) (Bitwise.shiftLeftBy 8 g4_b1xLo)
+
+        g4_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xLo) (Bitwise.shiftLeftBy 8 g4_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g4_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1Lo + g4_b1Lo)
+
+        g4_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1Lo g4_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1Lo g4_b1Lo)
+                        (Bitwise.complement g4_a1b1Lo)
+                    )
+                )
+
+        g4_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1Hi + g4_b1Hi + g4_a1b1Carry)
+
+        g4_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Lo + mb.m7.lo)
+
+        g4_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1b1Lo mb.m7.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1b1Lo mb.m7.lo)
+                        (Bitwise.complement g4_a2Lo)
+                    )
+                )
+
+        g4_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Hi + mb.m7.hi + g4_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g4_d2xHi =
+            Bitwise.xor g4_d1Hi g4_a2Hi
+
+        g4_d2xLo =
+            Bitwise.xor g4_d1Lo g4_a2Lo
+
+        g4_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xHi) (Bitwise.shiftLeftBy 16 g4_d2xLo)
+
+        g4_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xLo) (Bitwise.shiftLeftBy 16 g4_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g4_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_c1Lo + g4_d2Lo)
+
+        g4_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_c1Lo g4_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_c1Lo g4_d2Lo)
+                        (Bitwise.complement g4_c2Lo)
+                    )
+                )
+
+        g4_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_c1Hi + g4_d2Hi + g4_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g4_b2xHi =
+            Bitwise.xor g4_b1Hi g4_c2Hi
+
+        g4_b2xLo =
+            Bitwise.xor g4_b1Lo g4_c2Lo
+
+        g4_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xHi) (Bitwise.shiftRightZfBy 31 g4_b2xLo)
+
+        g4_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xLo) (Bitwise.shiftRightZfBy 31 g4_b2xHi)
+
+        -- Diagonal G5: a=g1.a, b=g2.b, c=g3.c, d=g0.d, x=m6, y=m3
+        -- a1 = add64(add64(a, b), x)
+        g5_abLo =
+            Bitwise.shiftRightZfBy 0 (g1_a2Lo + g2_b2Lo)
+
+        g5_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a2Lo g2_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a2Lo g2_b2Lo)
+                        (Bitwise.complement g5_abLo)
+                    )
+                )
+
+        g5_abHi =
+            Bitwise.shiftRightZfBy 0 (g1_a2Hi + g2_b2Hi + g5_abCarry)
+
+        g5_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_abLo + mb.m6.lo)
+
+        g5_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_abLo mb.m6.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_abLo mb.m6.lo)
+                        (Bitwise.complement g5_a1Lo)
+                    )
+                )
+
+        g5_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_abHi + mb.m6.hi + g5_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g5_d1Hi =
+            Bitwise.xor g0_d2Lo g5_a1Lo
+
+        g5_d1Lo =
+            Bitwise.xor g0_d2Hi g5_a1Hi
+
+        -- c1 = add64(c, d1)
+        g5_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c2Lo + g5_d1Lo)
+
+        g5_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c2Lo g5_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c2Lo g5_d1Lo)
+                        (Bitwise.complement g5_c1Lo)
+                    )
+                )
+
+        g5_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c2Hi + g5_d1Hi + g5_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g5_b1xHi =
+            Bitwise.xor g2_b2Hi g5_c1Hi
+
+        g5_b1xLo =
+            Bitwise.xor g2_b2Lo g5_c1Lo
+
+        g5_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xHi) (Bitwise.shiftLeftBy 8 g5_b1xLo)
+
+        g5_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xLo) (Bitwise.shiftLeftBy 8 g5_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g5_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1Lo + g5_b1Lo)
+
+        g5_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1Lo g5_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1Lo g5_b1Lo)
+                        (Bitwise.complement g5_a1b1Lo)
+                    )
+                )
+
+        g5_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1Hi + g5_b1Hi + g5_a1b1Carry)
+
+        g5_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Lo + mb.m3.lo)
+
+        g5_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1b1Lo mb.m3.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1b1Lo mb.m3.lo)
+                        (Bitwise.complement g5_a2Lo)
+                    )
+                )
+
+        g5_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Hi + mb.m3.hi + g5_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g5_d2xHi =
+            Bitwise.xor g5_d1Hi g5_a2Hi
+
+        g5_d2xLo =
+            Bitwise.xor g5_d1Lo g5_a2Lo
+
+        g5_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xHi) (Bitwise.shiftLeftBy 16 g5_d2xLo)
+
+        g5_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xLo) (Bitwise.shiftLeftBy 16 g5_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g5_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_c1Lo + g5_d2Lo)
+
+        g5_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_c1Lo g5_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_c1Lo g5_d2Lo)
+                        (Bitwise.complement g5_c2Lo)
+                    )
+                )
+
+        g5_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_c1Hi + g5_d2Hi + g5_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g5_b2xHi =
+            Bitwise.xor g5_b1Hi g5_c2Hi
+
+        g5_b2xLo =
+            Bitwise.xor g5_b1Lo g5_c2Lo
+
+        g5_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xHi) (Bitwise.shiftRightZfBy 31 g5_b2xLo)
+
+        g5_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xLo) (Bitwise.shiftRightZfBy 31 g5_b2xHi)
+
+        -- Diagonal G6: a=g2.a, b=g3.b, c=g0.c, d=g1.d, x=m9, y=m2
+        -- a1 = add64(add64(a, b), x)
+        g6_abLo =
+            Bitwise.shiftRightZfBy 0 (g2_a2Lo + g3_b2Lo)
+
+        g6_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a2Lo g3_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a2Lo g3_b2Lo)
+                        (Bitwise.complement g6_abLo)
+                    )
+                )
+
+        g6_abHi =
+            Bitwise.shiftRightZfBy 0 (g2_a2Hi + g3_b2Hi + g6_abCarry)
+
+        g6_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_abLo + mb.m9.lo)
+
+        g6_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_abLo mb.m9.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_abLo mb.m9.lo)
+                        (Bitwise.complement g6_a1Lo)
+                    )
+                )
+
+        g6_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_abHi + mb.m9.hi + g6_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g6_d1Hi =
+            Bitwise.xor g1_d2Lo g6_a1Lo
+
+        g6_d1Lo =
+            Bitwise.xor g1_d2Hi g6_a1Hi
+
+        -- c1 = add64(c, d1)
+        g6_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c2Lo + g6_d1Lo)
+
+        g6_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c2Lo g6_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c2Lo g6_d1Lo)
+                        (Bitwise.complement g6_c1Lo)
+                    )
+                )
+
+        g6_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c2Hi + g6_d1Hi + g6_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g6_b1xHi =
+            Bitwise.xor g3_b2Hi g6_c1Hi
+
+        g6_b1xLo =
+            Bitwise.xor g3_b2Lo g6_c1Lo
+
+        g6_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xHi) (Bitwise.shiftLeftBy 8 g6_b1xLo)
+
+        g6_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xLo) (Bitwise.shiftLeftBy 8 g6_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g6_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1Lo + g6_b1Lo)
+
+        g6_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1Lo g6_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1Lo g6_b1Lo)
+                        (Bitwise.complement g6_a1b1Lo)
+                    )
+                )
+
+        g6_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1Hi + g6_b1Hi + g6_a1b1Carry)
+
+        g6_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Lo + mb.m2.lo)
+
+        g6_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1b1Lo mb.m2.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1b1Lo mb.m2.lo)
+                        (Bitwise.complement g6_a2Lo)
+                    )
+                )
+
+        g6_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Hi + mb.m2.hi + g6_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g6_d2xHi =
+            Bitwise.xor g6_d1Hi g6_a2Hi
+
+        g6_d2xLo =
+            Bitwise.xor g6_d1Lo g6_a2Lo
+
+        g6_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xHi) (Bitwise.shiftLeftBy 16 g6_d2xLo)
+
+        g6_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xLo) (Bitwise.shiftLeftBy 16 g6_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g6_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_c1Lo + g6_d2Lo)
+
+        g6_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_c1Lo g6_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_c1Lo g6_d2Lo)
+                        (Bitwise.complement g6_c2Lo)
+                    )
+                )
+
+        g6_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_c1Hi + g6_d2Hi + g6_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g6_b2xHi =
+            Bitwise.xor g6_b1Hi g6_c2Hi
+
+        g6_b2xLo =
+            Bitwise.xor g6_b1Lo g6_c2Lo
+
+        g6_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xHi) (Bitwise.shiftRightZfBy 31 g6_b2xLo)
+
+        g6_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xLo) (Bitwise.shiftRightZfBy 31 g6_b2xHi)
+
+        -- Diagonal G7: a=g3.a, b=g0.b, c=g1.c, d=g2.d, x=m8, y=m11
+        -- a1 = add64(add64(a, b), x)
+        g7_abLo =
+            Bitwise.shiftRightZfBy 0 (g3_a2Lo + g0_b2Lo)
+
+        g7_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a2Lo g0_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a2Lo g0_b2Lo)
+                        (Bitwise.complement g7_abLo)
+                    )
+                )
+
+        g7_abHi =
+            Bitwise.shiftRightZfBy 0 (g3_a2Hi + g0_b2Hi + g7_abCarry)
+
+        g7_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_abLo + mb.m8.lo)
+
+        g7_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_abLo mb.m8.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_abLo mb.m8.lo)
+                        (Bitwise.complement g7_a1Lo)
+                    )
+                )
+
+        g7_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_abHi + mb.m8.hi + g7_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g7_d1Hi =
+            Bitwise.xor g2_d2Lo g7_a1Lo
+
+        g7_d1Lo =
+            Bitwise.xor g2_d2Hi g7_a1Hi
+
+        -- c1 = add64(c, d1)
+        g7_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c2Lo + g7_d1Lo)
+
+        g7_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c2Lo g7_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c2Lo g7_d1Lo)
+                        (Bitwise.complement g7_c1Lo)
+                    )
+                )
+
+        g7_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c2Hi + g7_d1Hi + g7_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g7_b1xHi =
+            Bitwise.xor g0_b2Hi g7_c1Hi
+
+        g7_b1xLo =
+            Bitwise.xor g0_b2Lo g7_c1Lo
+
+        g7_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xHi) (Bitwise.shiftLeftBy 8 g7_b1xLo)
+
+        g7_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xLo) (Bitwise.shiftLeftBy 8 g7_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g7_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1Lo + g7_b1Lo)
+
+        g7_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1Lo g7_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1Lo g7_b1Lo)
+                        (Bitwise.complement g7_a1b1Lo)
+                    )
+                )
+
+        g7_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1Hi + g7_b1Hi + g7_a1b1Carry)
+
+        g7_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Lo + mb.m11.lo)
+
+        g7_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1b1Lo mb.m11.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1b1Lo mb.m11.lo)
+                        (Bitwise.complement g7_a2Lo)
+                    )
+                )
+
+        g7_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Hi + mb.m11.hi + g7_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g7_d2xHi =
+            Bitwise.xor g7_d1Hi g7_a2Hi
+
+        g7_d2xLo =
+            Bitwise.xor g7_d1Lo g7_a2Lo
+
+        g7_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xHi) (Bitwise.shiftLeftBy 16 g7_d2xLo)
+
+        g7_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xLo) (Bitwise.shiftLeftBy 16 g7_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g7_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_c1Lo + g7_d2Lo)
+
+        g7_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_c1Lo g7_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_c1Lo g7_d2Lo)
+                        (Bitwise.complement g7_c2Lo)
+                    )
+                )
+
+        g7_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_c1Hi + g7_d2Hi + g7_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g7_b2xHi =
+            Bitwise.xor g7_b1Hi g7_c2Hi
+
+        g7_b2xLo =
+            Bitwise.xor g7_b1Lo g7_c2Lo
+
+        g7_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xHi) (Bitwise.shiftRightZfBy 31 g7_b2xLo)
+
+        g7_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
+
     in
-    { v0 = g4.a
-    , v1 = g5.a
-    , v2 = g6.a
-    , v3 = g7.a
-    , v4 = g7.b
-    , v5 = g4.b
-    , v6 = g5.b
-    , v7 = g6.b
-    , v8 = g6.c
-    , v9 = g7.c
-    , v10 = g4.c
-    , v11 = g5.c
-    , v12 = g5.d
-    , v13 = g6.d
-    , v14 = g7.d
-    , v15 = g4.d
+    { v0 = { hi = g4_a2Hi, lo = g4_a2Lo }
+    , v1 = { hi = g5_a2Hi, lo = g5_a2Lo }
+    , v2 = { hi = g6_a2Hi, lo = g6_a2Lo }
+    , v3 = { hi = g7_a2Hi, lo = g7_a2Lo }
+    , v4 = { hi = g7_b2Hi, lo = g7_b2Lo }
+    , v5 = { hi = g4_b2Hi, lo = g4_b2Lo }
+    , v6 = { hi = g5_b2Hi, lo = g5_b2Lo }
+    , v7 = { hi = g6_b2Hi, lo = g6_b2Lo }
+    , v8 = { hi = g6_c2Hi, lo = g6_c2Lo }
+    , v9 = { hi = g7_c2Hi, lo = g7_c2Lo }
+    , v10 = { hi = g4_c2Hi, lo = g4_c2Lo }
+    , v11 = { hi = g5_c2Hi, lo = g5_c2Lo }
+    , v12 = { hi = g5_d2Hi, lo = g5_d2Lo }
+    , v13 = { hi = g6_d2Hi, lo = g6_d2Lo }
+    , v14 = { hi = g7_d2Hi, lo = g7_d2Lo }
+    , v15 = { hi = g4_d2Hi, lo = g4_d2Lo }
     }
 
 
@@ -585,46 +8575,1199 @@ round6 mb v =
 round7 : U64MessageBlock -> WorkingVector -> WorkingVector
 round7 mb v =
     let
-        g0 =
-            g v.v0 v.v4 v.v8 v.v12 mb.m13 mb.m11
+        -- Column G0: a=v0, b=v4, c=v8, d=v12, x=m13, y=m11
+        -- a1 = add64(add64(a, b), x)
+        g0_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v0.lo + v.v4.lo)
 
-        g1 =
-            g v.v1 v.v5 v.v9 v.v13 mb.m7 mb.m14
+        g0_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v0.lo v.v4.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v0.lo v.v4.lo)
+                        (Bitwise.complement g0_abLo)
+                    )
+                )
 
-        g2 =
-            g v.v2 v.v6 v.v10 v.v14 mb.m12 mb.m1
+        g0_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v0.hi + v.v4.hi + g0_abCarry)
 
-        g3 =
-            g v.v3 v.v7 v.v11 v.v15 mb.m3 mb.m9
+        g0_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_abLo + mb.m13.lo)
 
-        g4 =
-            g g0.a g1.b g2.c g3.d mb.m5 mb.m0
+        g0_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_abLo mb.m13.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_abLo mb.m13.lo)
+                        (Bitwise.complement g0_a1Lo)
+                    )
+                )
 
-        g5 =
-            g g1.a g2.b g3.c g0.d mb.m15 mb.m4
+        g0_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_abHi + mb.m13.hi + g0_a1Carry)
 
-        g6 =
-            g g2.a g3.b g0.c g1.d mb.m8 mb.m6
+        -- d1 = rotr32(xor64(d, a1))
+        g0_d1Hi =
+            Bitwise.xor v.v12.lo g0_a1Lo
 
-        g7 =
-            g g3.a g0.b g1.c g2.d mb.m2 mb.m10
+        g0_d1Lo =
+            Bitwise.xor v.v12.hi g0_a1Hi
+
+        -- c1 = add64(c, d1)
+        g0_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v8.lo + g0_d1Lo)
+
+        g0_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v8.lo g0_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v8.lo g0_d1Lo)
+                        (Bitwise.complement g0_c1Lo)
+                    )
+                )
+
+        g0_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v8.hi + g0_d1Hi + g0_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g0_b1xHi =
+            Bitwise.xor v.v4.hi g0_c1Hi
+
+        g0_b1xLo =
+            Bitwise.xor v.v4.lo g0_c1Lo
+
+        g0_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xHi) (Bitwise.shiftLeftBy 8 g0_b1xLo)
+
+        g0_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xLo) (Bitwise.shiftLeftBy 8 g0_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g0_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1Lo + g0_b1Lo)
+
+        g0_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1Lo g0_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1Lo g0_b1Lo)
+                        (Bitwise.complement g0_a1b1Lo)
+                    )
+                )
+
+        g0_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1Hi + g0_b1Hi + g0_a1b1Carry)
+
+        g0_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Lo + mb.m11.lo)
+
+        g0_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1b1Lo mb.m11.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1b1Lo mb.m11.lo)
+                        (Bitwise.complement g0_a2Lo)
+                    )
+                )
+
+        g0_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Hi + mb.m11.hi + g0_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g0_d2xHi =
+            Bitwise.xor g0_d1Hi g0_a2Hi
+
+        g0_d2xLo =
+            Bitwise.xor g0_d1Lo g0_a2Lo
+
+        g0_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xHi) (Bitwise.shiftLeftBy 16 g0_d2xLo)
+
+        g0_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xLo) (Bitwise.shiftLeftBy 16 g0_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g0_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c1Lo + g0_d2Lo)
+
+        g0_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c1Lo g0_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c1Lo g0_d2Lo)
+                        (Bitwise.complement g0_c2Lo)
+                    )
+                )
+
+        g0_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c1Hi + g0_d2Hi + g0_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g0_b2xHi =
+            Bitwise.xor g0_b1Hi g0_c2Hi
+
+        g0_b2xLo =
+            Bitwise.xor g0_b1Lo g0_c2Lo
+
+        g0_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xHi) (Bitwise.shiftRightZfBy 31 g0_b2xLo)
+
+        g0_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xLo) (Bitwise.shiftRightZfBy 31 g0_b2xHi)
+
+        -- Column G1: a=v1, b=v5, c=v9, d=v13, x=m7, y=m14
+        -- a1 = add64(add64(a, b), x)
+        g1_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v1.lo + v.v5.lo)
+
+        g1_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v1.lo v.v5.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v1.lo v.v5.lo)
+                        (Bitwise.complement g1_abLo)
+                    )
+                )
+
+        g1_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v1.hi + v.v5.hi + g1_abCarry)
+
+        g1_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_abLo + mb.m7.lo)
+
+        g1_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_abLo mb.m7.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_abLo mb.m7.lo)
+                        (Bitwise.complement g1_a1Lo)
+                    )
+                )
+
+        g1_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_abHi + mb.m7.hi + g1_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g1_d1Hi =
+            Bitwise.xor v.v13.lo g1_a1Lo
+
+        g1_d1Lo =
+            Bitwise.xor v.v13.hi g1_a1Hi
+
+        -- c1 = add64(c, d1)
+        g1_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v9.lo + g1_d1Lo)
+
+        g1_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v9.lo g1_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v9.lo g1_d1Lo)
+                        (Bitwise.complement g1_c1Lo)
+                    )
+                )
+
+        g1_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v9.hi + g1_d1Hi + g1_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g1_b1xHi =
+            Bitwise.xor v.v5.hi g1_c1Hi
+
+        g1_b1xLo =
+            Bitwise.xor v.v5.lo g1_c1Lo
+
+        g1_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xHi) (Bitwise.shiftLeftBy 8 g1_b1xLo)
+
+        g1_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xLo) (Bitwise.shiftLeftBy 8 g1_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g1_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1Lo + g1_b1Lo)
+
+        g1_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1Lo g1_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1Lo g1_b1Lo)
+                        (Bitwise.complement g1_a1b1Lo)
+                    )
+                )
+
+        g1_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1Hi + g1_b1Hi + g1_a1b1Carry)
+
+        g1_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Lo + mb.m14.lo)
+
+        g1_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1b1Lo mb.m14.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1b1Lo mb.m14.lo)
+                        (Bitwise.complement g1_a2Lo)
+                    )
+                )
+
+        g1_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Hi + mb.m14.hi + g1_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g1_d2xHi =
+            Bitwise.xor g1_d1Hi g1_a2Hi
+
+        g1_d2xLo =
+            Bitwise.xor g1_d1Lo g1_a2Lo
+
+        g1_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xHi) (Bitwise.shiftLeftBy 16 g1_d2xLo)
+
+        g1_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xLo) (Bitwise.shiftLeftBy 16 g1_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g1_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c1Lo + g1_d2Lo)
+
+        g1_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c1Lo g1_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c1Lo g1_d2Lo)
+                        (Bitwise.complement g1_c2Lo)
+                    )
+                )
+
+        g1_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c1Hi + g1_d2Hi + g1_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g1_b2xHi =
+            Bitwise.xor g1_b1Hi g1_c2Hi
+
+        g1_b2xLo =
+            Bitwise.xor g1_b1Lo g1_c2Lo
+
+        g1_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xHi) (Bitwise.shiftRightZfBy 31 g1_b2xLo)
+
+        g1_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xLo) (Bitwise.shiftRightZfBy 31 g1_b2xHi)
+
+        -- Column G2: a=v2, b=v6, c=v10, d=v14, x=m12, y=m1
+        -- a1 = add64(add64(a, b), x)
+        g2_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v2.lo + v.v6.lo)
+
+        g2_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v2.lo v.v6.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v2.lo v.v6.lo)
+                        (Bitwise.complement g2_abLo)
+                    )
+                )
+
+        g2_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v2.hi + v.v6.hi + g2_abCarry)
+
+        g2_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_abLo + mb.m12.lo)
+
+        g2_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_abLo mb.m12.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_abLo mb.m12.lo)
+                        (Bitwise.complement g2_a1Lo)
+                    )
+                )
+
+        g2_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_abHi + mb.m12.hi + g2_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g2_d1Hi =
+            Bitwise.xor v.v14.lo g2_a1Lo
+
+        g2_d1Lo =
+            Bitwise.xor v.v14.hi g2_a1Hi
+
+        -- c1 = add64(c, d1)
+        g2_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v10.lo + g2_d1Lo)
+
+        g2_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v10.lo g2_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v10.lo g2_d1Lo)
+                        (Bitwise.complement g2_c1Lo)
+                    )
+                )
+
+        g2_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v10.hi + g2_d1Hi + g2_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g2_b1xHi =
+            Bitwise.xor v.v6.hi g2_c1Hi
+
+        g2_b1xLo =
+            Bitwise.xor v.v6.lo g2_c1Lo
+
+        g2_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xHi) (Bitwise.shiftLeftBy 8 g2_b1xLo)
+
+        g2_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xLo) (Bitwise.shiftLeftBy 8 g2_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g2_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1Lo + g2_b1Lo)
+
+        g2_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1Lo g2_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1Lo g2_b1Lo)
+                        (Bitwise.complement g2_a1b1Lo)
+                    )
+                )
+
+        g2_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1Hi + g2_b1Hi + g2_a1b1Carry)
+
+        g2_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Lo + mb.m1.lo)
+
+        g2_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1b1Lo mb.m1.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1b1Lo mb.m1.lo)
+                        (Bitwise.complement g2_a2Lo)
+                    )
+                )
+
+        g2_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Hi + mb.m1.hi + g2_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g2_d2xHi =
+            Bitwise.xor g2_d1Hi g2_a2Hi
+
+        g2_d2xLo =
+            Bitwise.xor g2_d1Lo g2_a2Lo
+
+        g2_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xHi) (Bitwise.shiftLeftBy 16 g2_d2xLo)
+
+        g2_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xLo) (Bitwise.shiftLeftBy 16 g2_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g2_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c1Lo + g2_d2Lo)
+
+        g2_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c1Lo g2_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c1Lo g2_d2Lo)
+                        (Bitwise.complement g2_c2Lo)
+                    )
+                )
+
+        g2_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c1Hi + g2_d2Hi + g2_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g2_b2xHi =
+            Bitwise.xor g2_b1Hi g2_c2Hi
+
+        g2_b2xLo =
+            Bitwise.xor g2_b1Lo g2_c2Lo
+
+        g2_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xHi) (Bitwise.shiftRightZfBy 31 g2_b2xLo)
+
+        g2_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xLo) (Bitwise.shiftRightZfBy 31 g2_b2xHi)
+
+        -- Column G3: a=v3, b=v7, c=v11, d=v15, x=m3, y=m9
+        -- a1 = add64(add64(a, b), x)
+        g3_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v3.lo + v.v7.lo)
+
+        g3_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v3.lo v.v7.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v3.lo v.v7.lo)
+                        (Bitwise.complement g3_abLo)
+                    )
+                )
+
+        g3_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v3.hi + v.v7.hi + g3_abCarry)
+
+        g3_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_abLo + mb.m3.lo)
+
+        g3_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_abLo mb.m3.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_abLo mb.m3.lo)
+                        (Bitwise.complement g3_a1Lo)
+                    )
+                )
+
+        g3_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_abHi + mb.m3.hi + g3_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g3_d1Hi =
+            Bitwise.xor v.v15.lo g3_a1Lo
+
+        g3_d1Lo =
+            Bitwise.xor v.v15.hi g3_a1Hi
+
+        -- c1 = add64(c, d1)
+        g3_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v11.lo + g3_d1Lo)
+
+        g3_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v11.lo g3_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v11.lo g3_d1Lo)
+                        (Bitwise.complement g3_c1Lo)
+                    )
+                )
+
+        g3_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v11.hi + g3_d1Hi + g3_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g3_b1xHi =
+            Bitwise.xor v.v7.hi g3_c1Hi
+
+        g3_b1xLo =
+            Bitwise.xor v.v7.lo g3_c1Lo
+
+        g3_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xHi) (Bitwise.shiftLeftBy 8 g3_b1xLo)
+
+        g3_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xLo) (Bitwise.shiftLeftBy 8 g3_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g3_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1Lo + g3_b1Lo)
+
+        g3_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1Lo g3_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1Lo g3_b1Lo)
+                        (Bitwise.complement g3_a1b1Lo)
+                    )
+                )
+
+        g3_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1Hi + g3_b1Hi + g3_a1b1Carry)
+
+        g3_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Lo + mb.m9.lo)
+
+        g3_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1b1Lo mb.m9.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1b1Lo mb.m9.lo)
+                        (Bitwise.complement g3_a2Lo)
+                    )
+                )
+
+        g3_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Hi + mb.m9.hi + g3_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g3_d2xHi =
+            Bitwise.xor g3_d1Hi g3_a2Hi
+
+        g3_d2xLo =
+            Bitwise.xor g3_d1Lo g3_a2Lo
+
+        g3_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xHi) (Bitwise.shiftLeftBy 16 g3_d2xLo)
+
+        g3_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xLo) (Bitwise.shiftLeftBy 16 g3_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g3_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c1Lo + g3_d2Lo)
+
+        g3_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c1Lo g3_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c1Lo g3_d2Lo)
+                        (Bitwise.complement g3_c2Lo)
+                    )
+                )
+
+        g3_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c1Hi + g3_d2Hi + g3_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g3_b2xHi =
+            Bitwise.xor g3_b1Hi g3_c2Hi
+
+        g3_b2xLo =
+            Bitwise.xor g3_b1Lo g3_c2Lo
+
+        g3_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xHi) (Bitwise.shiftRightZfBy 31 g3_b2xLo)
+
+        g3_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xLo) (Bitwise.shiftRightZfBy 31 g3_b2xHi)
+
+        -- Diagonal G4: a=g0.a, b=g1.b, c=g2.c, d=g3.d, x=m5, y=m0
+        -- a1 = add64(add64(a, b), x)
+        g4_abLo =
+            Bitwise.shiftRightZfBy 0 (g0_a2Lo + g1_b2Lo)
+
+        g4_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a2Lo g1_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a2Lo g1_b2Lo)
+                        (Bitwise.complement g4_abLo)
+                    )
+                )
+
+        g4_abHi =
+            Bitwise.shiftRightZfBy 0 (g0_a2Hi + g1_b2Hi + g4_abCarry)
+
+        g4_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_abLo + mb.m5.lo)
+
+        g4_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_abLo mb.m5.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_abLo mb.m5.lo)
+                        (Bitwise.complement g4_a1Lo)
+                    )
+                )
+
+        g4_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_abHi + mb.m5.hi + g4_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g4_d1Hi =
+            Bitwise.xor g3_d2Lo g4_a1Lo
+
+        g4_d1Lo =
+            Bitwise.xor g3_d2Hi g4_a1Hi
+
+        -- c1 = add64(c, d1)
+        g4_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c2Lo + g4_d1Lo)
+
+        g4_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c2Lo g4_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c2Lo g4_d1Lo)
+                        (Bitwise.complement g4_c1Lo)
+                    )
+                )
+
+        g4_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c2Hi + g4_d1Hi + g4_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g4_b1xHi =
+            Bitwise.xor g1_b2Hi g4_c1Hi
+
+        g4_b1xLo =
+            Bitwise.xor g1_b2Lo g4_c1Lo
+
+        g4_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xHi) (Bitwise.shiftLeftBy 8 g4_b1xLo)
+
+        g4_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xLo) (Bitwise.shiftLeftBy 8 g4_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g4_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1Lo + g4_b1Lo)
+
+        g4_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1Lo g4_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1Lo g4_b1Lo)
+                        (Bitwise.complement g4_a1b1Lo)
+                    )
+                )
+
+        g4_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1Hi + g4_b1Hi + g4_a1b1Carry)
+
+        g4_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Lo + mb.m0.lo)
+
+        g4_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1b1Lo mb.m0.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1b1Lo mb.m0.lo)
+                        (Bitwise.complement g4_a2Lo)
+                    )
+                )
+
+        g4_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Hi + mb.m0.hi + g4_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g4_d2xHi =
+            Bitwise.xor g4_d1Hi g4_a2Hi
+
+        g4_d2xLo =
+            Bitwise.xor g4_d1Lo g4_a2Lo
+
+        g4_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xHi) (Bitwise.shiftLeftBy 16 g4_d2xLo)
+
+        g4_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xLo) (Bitwise.shiftLeftBy 16 g4_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g4_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_c1Lo + g4_d2Lo)
+
+        g4_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_c1Lo g4_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_c1Lo g4_d2Lo)
+                        (Bitwise.complement g4_c2Lo)
+                    )
+                )
+
+        g4_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_c1Hi + g4_d2Hi + g4_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g4_b2xHi =
+            Bitwise.xor g4_b1Hi g4_c2Hi
+
+        g4_b2xLo =
+            Bitwise.xor g4_b1Lo g4_c2Lo
+
+        g4_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xHi) (Bitwise.shiftRightZfBy 31 g4_b2xLo)
+
+        g4_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xLo) (Bitwise.shiftRightZfBy 31 g4_b2xHi)
+
+        -- Diagonal G5: a=g1.a, b=g2.b, c=g3.c, d=g0.d, x=m15, y=m4
+        -- a1 = add64(add64(a, b), x)
+        g5_abLo =
+            Bitwise.shiftRightZfBy 0 (g1_a2Lo + g2_b2Lo)
+
+        g5_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a2Lo g2_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a2Lo g2_b2Lo)
+                        (Bitwise.complement g5_abLo)
+                    )
+                )
+
+        g5_abHi =
+            Bitwise.shiftRightZfBy 0 (g1_a2Hi + g2_b2Hi + g5_abCarry)
+
+        g5_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_abLo + mb.m15.lo)
+
+        g5_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_abLo mb.m15.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_abLo mb.m15.lo)
+                        (Bitwise.complement g5_a1Lo)
+                    )
+                )
+
+        g5_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_abHi + mb.m15.hi + g5_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g5_d1Hi =
+            Bitwise.xor g0_d2Lo g5_a1Lo
+
+        g5_d1Lo =
+            Bitwise.xor g0_d2Hi g5_a1Hi
+
+        -- c1 = add64(c, d1)
+        g5_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c2Lo + g5_d1Lo)
+
+        g5_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c2Lo g5_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c2Lo g5_d1Lo)
+                        (Bitwise.complement g5_c1Lo)
+                    )
+                )
+
+        g5_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c2Hi + g5_d1Hi + g5_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g5_b1xHi =
+            Bitwise.xor g2_b2Hi g5_c1Hi
+
+        g5_b1xLo =
+            Bitwise.xor g2_b2Lo g5_c1Lo
+
+        g5_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xHi) (Bitwise.shiftLeftBy 8 g5_b1xLo)
+
+        g5_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xLo) (Bitwise.shiftLeftBy 8 g5_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g5_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1Lo + g5_b1Lo)
+
+        g5_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1Lo g5_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1Lo g5_b1Lo)
+                        (Bitwise.complement g5_a1b1Lo)
+                    )
+                )
+
+        g5_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1Hi + g5_b1Hi + g5_a1b1Carry)
+
+        g5_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Lo + mb.m4.lo)
+
+        g5_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1b1Lo mb.m4.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1b1Lo mb.m4.lo)
+                        (Bitwise.complement g5_a2Lo)
+                    )
+                )
+
+        g5_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Hi + mb.m4.hi + g5_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g5_d2xHi =
+            Bitwise.xor g5_d1Hi g5_a2Hi
+
+        g5_d2xLo =
+            Bitwise.xor g5_d1Lo g5_a2Lo
+
+        g5_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xHi) (Bitwise.shiftLeftBy 16 g5_d2xLo)
+
+        g5_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xLo) (Bitwise.shiftLeftBy 16 g5_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g5_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_c1Lo + g5_d2Lo)
+
+        g5_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_c1Lo g5_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_c1Lo g5_d2Lo)
+                        (Bitwise.complement g5_c2Lo)
+                    )
+                )
+
+        g5_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_c1Hi + g5_d2Hi + g5_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g5_b2xHi =
+            Bitwise.xor g5_b1Hi g5_c2Hi
+
+        g5_b2xLo =
+            Bitwise.xor g5_b1Lo g5_c2Lo
+
+        g5_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xHi) (Bitwise.shiftRightZfBy 31 g5_b2xLo)
+
+        g5_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xLo) (Bitwise.shiftRightZfBy 31 g5_b2xHi)
+
+        -- Diagonal G6: a=g2.a, b=g3.b, c=g0.c, d=g1.d, x=m8, y=m6
+        -- a1 = add64(add64(a, b), x)
+        g6_abLo =
+            Bitwise.shiftRightZfBy 0 (g2_a2Lo + g3_b2Lo)
+
+        g6_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a2Lo g3_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a2Lo g3_b2Lo)
+                        (Bitwise.complement g6_abLo)
+                    )
+                )
+
+        g6_abHi =
+            Bitwise.shiftRightZfBy 0 (g2_a2Hi + g3_b2Hi + g6_abCarry)
+
+        g6_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_abLo + mb.m8.lo)
+
+        g6_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_abLo mb.m8.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_abLo mb.m8.lo)
+                        (Bitwise.complement g6_a1Lo)
+                    )
+                )
+
+        g6_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_abHi + mb.m8.hi + g6_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g6_d1Hi =
+            Bitwise.xor g1_d2Lo g6_a1Lo
+
+        g6_d1Lo =
+            Bitwise.xor g1_d2Hi g6_a1Hi
+
+        -- c1 = add64(c, d1)
+        g6_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c2Lo + g6_d1Lo)
+
+        g6_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c2Lo g6_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c2Lo g6_d1Lo)
+                        (Bitwise.complement g6_c1Lo)
+                    )
+                )
+
+        g6_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c2Hi + g6_d1Hi + g6_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g6_b1xHi =
+            Bitwise.xor g3_b2Hi g6_c1Hi
+
+        g6_b1xLo =
+            Bitwise.xor g3_b2Lo g6_c1Lo
+
+        g6_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xHi) (Bitwise.shiftLeftBy 8 g6_b1xLo)
+
+        g6_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xLo) (Bitwise.shiftLeftBy 8 g6_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g6_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1Lo + g6_b1Lo)
+
+        g6_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1Lo g6_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1Lo g6_b1Lo)
+                        (Bitwise.complement g6_a1b1Lo)
+                    )
+                )
+
+        g6_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1Hi + g6_b1Hi + g6_a1b1Carry)
+
+        g6_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Lo + mb.m6.lo)
+
+        g6_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1b1Lo mb.m6.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1b1Lo mb.m6.lo)
+                        (Bitwise.complement g6_a2Lo)
+                    )
+                )
+
+        g6_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Hi + mb.m6.hi + g6_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g6_d2xHi =
+            Bitwise.xor g6_d1Hi g6_a2Hi
+
+        g6_d2xLo =
+            Bitwise.xor g6_d1Lo g6_a2Lo
+
+        g6_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xHi) (Bitwise.shiftLeftBy 16 g6_d2xLo)
+
+        g6_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xLo) (Bitwise.shiftLeftBy 16 g6_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g6_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_c1Lo + g6_d2Lo)
+
+        g6_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_c1Lo g6_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_c1Lo g6_d2Lo)
+                        (Bitwise.complement g6_c2Lo)
+                    )
+                )
+
+        g6_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_c1Hi + g6_d2Hi + g6_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g6_b2xHi =
+            Bitwise.xor g6_b1Hi g6_c2Hi
+
+        g6_b2xLo =
+            Bitwise.xor g6_b1Lo g6_c2Lo
+
+        g6_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xHi) (Bitwise.shiftRightZfBy 31 g6_b2xLo)
+
+        g6_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xLo) (Bitwise.shiftRightZfBy 31 g6_b2xHi)
+
+        -- Diagonal G7: a=g3.a, b=g0.b, c=g1.c, d=g2.d, x=m2, y=m10
+        -- a1 = add64(add64(a, b), x)
+        g7_abLo =
+            Bitwise.shiftRightZfBy 0 (g3_a2Lo + g0_b2Lo)
+
+        g7_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a2Lo g0_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a2Lo g0_b2Lo)
+                        (Bitwise.complement g7_abLo)
+                    )
+                )
+
+        g7_abHi =
+            Bitwise.shiftRightZfBy 0 (g3_a2Hi + g0_b2Hi + g7_abCarry)
+
+        g7_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_abLo + mb.m2.lo)
+
+        g7_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_abLo mb.m2.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_abLo mb.m2.lo)
+                        (Bitwise.complement g7_a1Lo)
+                    )
+                )
+
+        g7_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_abHi + mb.m2.hi + g7_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g7_d1Hi =
+            Bitwise.xor g2_d2Lo g7_a1Lo
+
+        g7_d1Lo =
+            Bitwise.xor g2_d2Hi g7_a1Hi
+
+        -- c1 = add64(c, d1)
+        g7_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c2Lo + g7_d1Lo)
+
+        g7_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c2Lo g7_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c2Lo g7_d1Lo)
+                        (Bitwise.complement g7_c1Lo)
+                    )
+                )
+
+        g7_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c2Hi + g7_d1Hi + g7_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g7_b1xHi =
+            Bitwise.xor g0_b2Hi g7_c1Hi
+
+        g7_b1xLo =
+            Bitwise.xor g0_b2Lo g7_c1Lo
+
+        g7_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xHi) (Bitwise.shiftLeftBy 8 g7_b1xLo)
+
+        g7_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xLo) (Bitwise.shiftLeftBy 8 g7_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g7_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1Lo + g7_b1Lo)
+
+        g7_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1Lo g7_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1Lo g7_b1Lo)
+                        (Bitwise.complement g7_a1b1Lo)
+                    )
+                )
+
+        g7_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1Hi + g7_b1Hi + g7_a1b1Carry)
+
+        g7_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Lo + mb.m10.lo)
+
+        g7_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1b1Lo mb.m10.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1b1Lo mb.m10.lo)
+                        (Bitwise.complement g7_a2Lo)
+                    )
+                )
+
+        g7_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Hi + mb.m10.hi + g7_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g7_d2xHi =
+            Bitwise.xor g7_d1Hi g7_a2Hi
+
+        g7_d2xLo =
+            Bitwise.xor g7_d1Lo g7_a2Lo
+
+        g7_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xHi) (Bitwise.shiftLeftBy 16 g7_d2xLo)
+
+        g7_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xLo) (Bitwise.shiftLeftBy 16 g7_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g7_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_c1Lo + g7_d2Lo)
+
+        g7_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_c1Lo g7_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_c1Lo g7_d2Lo)
+                        (Bitwise.complement g7_c2Lo)
+                    )
+                )
+
+        g7_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_c1Hi + g7_d2Hi + g7_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g7_b2xHi =
+            Bitwise.xor g7_b1Hi g7_c2Hi
+
+        g7_b2xLo =
+            Bitwise.xor g7_b1Lo g7_c2Lo
+
+        g7_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xHi) (Bitwise.shiftRightZfBy 31 g7_b2xLo)
+
+        g7_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
+
     in
-    { v0 = g4.a
-    , v1 = g5.a
-    , v2 = g6.a
-    , v3 = g7.a
-    , v4 = g7.b
-    , v5 = g4.b
-    , v6 = g5.b
-    , v7 = g6.b
-    , v8 = g6.c
-    , v9 = g7.c
-    , v10 = g4.c
-    , v11 = g5.c
-    , v12 = g5.d
-    , v13 = g6.d
-    , v14 = g7.d
-    , v15 = g4.d
+    { v0 = { hi = g4_a2Hi, lo = g4_a2Lo }
+    , v1 = { hi = g5_a2Hi, lo = g5_a2Lo }
+    , v2 = { hi = g6_a2Hi, lo = g6_a2Lo }
+    , v3 = { hi = g7_a2Hi, lo = g7_a2Lo }
+    , v4 = { hi = g7_b2Hi, lo = g7_b2Lo }
+    , v5 = { hi = g4_b2Hi, lo = g4_b2Lo }
+    , v6 = { hi = g5_b2Hi, lo = g5_b2Lo }
+    , v7 = { hi = g6_b2Hi, lo = g6_b2Lo }
+    , v8 = { hi = g6_c2Hi, lo = g6_c2Lo }
+    , v9 = { hi = g7_c2Hi, lo = g7_c2Lo }
+    , v10 = { hi = g4_c2Hi, lo = g4_c2Lo }
+    , v11 = { hi = g5_c2Hi, lo = g5_c2Lo }
+    , v12 = { hi = g5_d2Hi, lo = g5_d2Lo }
+    , v13 = { hi = g6_d2Hi, lo = g6_d2Lo }
+    , v14 = { hi = g7_d2Hi, lo = g7_d2Lo }
+    , v15 = { hi = g4_d2Hi, lo = g4_d2Lo }
     }
 
 
@@ -633,46 +9776,1199 @@ round7 mb v =
 round8 : U64MessageBlock -> WorkingVector -> WorkingVector
 round8 mb v =
     let
-        g0 =
-            g v.v0 v.v4 v.v8 v.v12 mb.m6 mb.m15
+        -- Column G0: a=v0, b=v4, c=v8, d=v12, x=m6, y=m15
+        -- a1 = add64(add64(a, b), x)
+        g0_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v0.lo + v.v4.lo)
 
-        g1 =
-            g v.v1 v.v5 v.v9 v.v13 mb.m14 mb.m9
+        g0_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v0.lo v.v4.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v0.lo v.v4.lo)
+                        (Bitwise.complement g0_abLo)
+                    )
+                )
 
-        g2 =
-            g v.v2 v.v6 v.v10 v.v14 mb.m11 mb.m3
+        g0_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v0.hi + v.v4.hi + g0_abCarry)
 
-        g3 =
-            g v.v3 v.v7 v.v11 v.v15 mb.m0 mb.m8
+        g0_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_abLo + mb.m6.lo)
 
-        g4 =
-            g g0.a g1.b g2.c g3.d mb.m12 mb.m2
+        g0_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_abLo mb.m6.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_abLo mb.m6.lo)
+                        (Bitwise.complement g0_a1Lo)
+                    )
+                )
 
-        g5 =
-            g g1.a g2.b g3.c g0.d mb.m13 mb.m7
+        g0_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_abHi + mb.m6.hi + g0_a1Carry)
 
-        g6 =
-            g g2.a g3.b g0.c g1.d mb.m1 mb.m4
+        -- d1 = rotr32(xor64(d, a1))
+        g0_d1Hi =
+            Bitwise.xor v.v12.lo g0_a1Lo
 
-        g7 =
-            g g3.a g0.b g1.c g2.d mb.m10 mb.m5
+        g0_d1Lo =
+            Bitwise.xor v.v12.hi g0_a1Hi
+
+        -- c1 = add64(c, d1)
+        g0_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v8.lo + g0_d1Lo)
+
+        g0_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v8.lo g0_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v8.lo g0_d1Lo)
+                        (Bitwise.complement g0_c1Lo)
+                    )
+                )
+
+        g0_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v8.hi + g0_d1Hi + g0_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g0_b1xHi =
+            Bitwise.xor v.v4.hi g0_c1Hi
+
+        g0_b1xLo =
+            Bitwise.xor v.v4.lo g0_c1Lo
+
+        g0_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xHi) (Bitwise.shiftLeftBy 8 g0_b1xLo)
+
+        g0_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xLo) (Bitwise.shiftLeftBy 8 g0_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g0_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1Lo + g0_b1Lo)
+
+        g0_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1Lo g0_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1Lo g0_b1Lo)
+                        (Bitwise.complement g0_a1b1Lo)
+                    )
+                )
+
+        g0_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1Hi + g0_b1Hi + g0_a1b1Carry)
+
+        g0_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Lo + mb.m15.lo)
+
+        g0_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1b1Lo mb.m15.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1b1Lo mb.m15.lo)
+                        (Bitwise.complement g0_a2Lo)
+                    )
+                )
+
+        g0_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Hi + mb.m15.hi + g0_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g0_d2xHi =
+            Bitwise.xor g0_d1Hi g0_a2Hi
+
+        g0_d2xLo =
+            Bitwise.xor g0_d1Lo g0_a2Lo
+
+        g0_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xHi) (Bitwise.shiftLeftBy 16 g0_d2xLo)
+
+        g0_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xLo) (Bitwise.shiftLeftBy 16 g0_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g0_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c1Lo + g0_d2Lo)
+
+        g0_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c1Lo g0_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c1Lo g0_d2Lo)
+                        (Bitwise.complement g0_c2Lo)
+                    )
+                )
+
+        g0_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c1Hi + g0_d2Hi + g0_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g0_b2xHi =
+            Bitwise.xor g0_b1Hi g0_c2Hi
+
+        g0_b2xLo =
+            Bitwise.xor g0_b1Lo g0_c2Lo
+
+        g0_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xHi) (Bitwise.shiftRightZfBy 31 g0_b2xLo)
+
+        g0_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xLo) (Bitwise.shiftRightZfBy 31 g0_b2xHi)
+
+        -- Column G1: a=v1, b=v5, c=v9, d=v13, x=m14, y=m9
+        -- a1 = add64(add64(a, b), x)
+        g1_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v1.lo + v.v5.lo)
+
+        g1_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v1.lo v.v5.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v1.lo v.v5.lo)
+                        (Bitwise.complement g1_abLo)
+                    )
+                )
+
+        g1_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v1.hi + v.v5.hi + g1_abCarry)
+
+        g1_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_abLo + mb.m14.lo)
+
+        g1_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_abLo mb.m14.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_abLo mb.m14.lo)
+                        (Bitwise.complement g1_a1Lo)
+                    )
+                )
+
+        g1_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_abHi + mb.m14.hi + g1_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g1_d1Hi =
+            Bitwise.xor v.v13.lo g1_a1Lo
+
+        g1_d1Lo =
+            Bitwise.xor v.v13.hi g1_a1Hi
+
+        -- c1 = add64(c, d1)
+        g1_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v9.lo + g1_d1Lo)
+
+        g1_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v9.lo g1_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v9.lo g1_d1Lo)
+                        (Bitwise.complement g1_c1Lo)
+                    )
+                )
+
+        g1_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v9.hi + g1_d1Hi + g1_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g1_b1xHi =
+            Bitwise.xor v.v5.hi g1_c1Hi
+
+        g1_b1xLo =
+            Bitwise.xor v.v5.lo g1_c1Lo
+
+        g1_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xHi) (Bitwise.shiftLeftBy 8 g1_b1xLo)
+
+        g1_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xLo) (Bitwise.shiftLeftBy 8 g1_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g1_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1Lo + g1_b1Lo)
+
+        g1_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1Lo g1_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1Lo g1_b1Lo)
+                        (Bitwise.complement g1_a1b1Lo)
+                    )
+                )
+
+        g1_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1Hi + g1_b1Hi + g1_a1b1Carry)
+
+        g1_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Lo + mb.m9.lo)
+
+        g1_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1b1Lo mb.m9.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1b1Lo mb.m9.lo)
+                        (Bitwise.complement g1_a2Lo)
+                    )
+                )
+
+        g1_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Hi + mb.m9.hi + g1_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g1_d2xHi =
+            Bitwise.xor g1_d1Hi g1_a2Hi
+
+        g1_d2xLo =
+            Bitwise.xor g1_d1Lo g1_a2Lo
+
+        g1_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xHi) (Bitwise.shiftLeftBy 16 g1_d2xLo)
+
+        g1_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xLo) (Bitwise.shiftLeftBy 16 g1_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g1_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c1Lo + g1_d2Lo)
+
+        g1_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c1Lo g1_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c1Lo g1_d2Lo)
+                        (Bitwise.complement g1_c2Lo)
+                    )
+                )
+
+        g1_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c1Hi + g1_d2Hi + g1_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g1_b2xHi =
+            Bitwise.xor g1_b1Hi g1_c2Hi
+
+        g1_b2xLo =
+            Bitwise.xor g1_b1Lo g1_c2Lo
+
+        g1_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xHi) (Bitwise.shiftRightZfBy 31 g1_b2xLo)
+
+        g1_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xLo) (Bitwise.shiftRightZfBy 31 g1_b2xHi)
+
+        -- Column G2: a=v2, b=v6, c=v10, d=v14, x=m11, y=m3
+        -- a1 = add64(add64(a, b), x)
+        g2_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v2.lo + v.v6.lo)
+
+        g2_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v2.lo v.v6.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v2.lo v.v6.lo)
+                        (Bitwise.complement g2_abLo)
+                    )
+                )
+
+        g2_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v2.hi + v.v6.hi + g2_abCarry)
+
+        g2_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_abLo + mb.m11.lo)
+
+        g2_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_abLo mb.m11.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_abLo mb.m11.lo)
+                        (Bitwise.complement g2_a1Lo)
+                    )
+                )
+
+        g2_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_abHi + mb.m11.hi + g2_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g2_d1Hi =
+            Bitwise.xor v.v14.lo g2_a1Lo
+
+        g2_d1Lo =
+            Bitwise.xor v.v14.hi g2_a1Hi
+
+        -- c1 = add64(c, d1)
+        g2_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v10.lo + g2_d1Lo)
+
+        g2_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v10.lo g2_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v10.lo g2_d1Lo)
+                        (Bitwise.complement g2_c1Lo)
+                    )
+                )
+
+        g2_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v10.hi + g2_d1Hi + g2_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g2_b1xHi =
+            Bitwise.xor v.v6.hi g2_c1Hi
+
+        g2_b1xLo =
+            Bitwise.xor v.v6.lo g2_c1Lo
+
+        g2_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xHi) (Bitwise.shiftLeftBy 8 g2_b1xLo)
+
+        g2_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xLo) (Bitwise.shiftLeftBy 8 g2_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g2_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1Lo + g2_b1Lo)
+
+        g2_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1Lo g2_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1Lo g2_b1Lo)
+                        (Bitwise.complement g2_a1b1Lo)
+                    )
+                )
+
+        g2_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1Hi + g2_b1Hi + g2_a1b1Carry)
+
+        g2_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Lo + mb.m3.lo)
+
+        g2_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1b1Lo mb.m3.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1b1Lo mb.m3.lo)
+                        (Bitwise.complement g2_a2Lo)
+                    )
+                )
+
+        g2_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Hi + mb.m3.hi + g2_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g2_d2xHi =
+            Bitwise.xor g2_d1Hi g2_a2Hi
+
+        g2_d2xLo =
+            Bitwise.xor g2_d1Lo g2_a2Lo
+
+        g2_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xHi) (Bitwise.shiftLeftBy 16 g2_d2xLo)
+
+        g2_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xLo) (Bitwise.shiftLeftBy 16 g2_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g2_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c1Lo + g2_d2Lo)
+
+        g2_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c1Lo g2_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c1Lo g2_d2Lo)
+                        (Bitwise.complement g2_c2Lo)
+                    )
+                )
+
+        g2_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c1Hi + g2_d2Hi + g2_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g2_b2xHi =
+            Bitwise.xor g2_b1Hi g2_c2Hi
+
+        g2_b2xLo =
+            Bitwise.xor g2_b1Lo g2_c2Lo
+
+        g2_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xHi) (Bitwise.shiftRightZfBy 31 g2_b2xLo)
+
+        g2_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xLo) (Bitwise.shiftRightZfBy 31 g2_b2xHi)
+
+        -- Column G3: a=v3, b=v7, c=v11, d=v15, x=m0, y=m8
+        -- a1 = add64(add64(a, b), x)
+        g3_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v3.lo + v.v7.lo)
+
+        g3_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v3.lo v.v7.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v3.lo v.v7.lo)
+                        (Bitwise.complement g3_abLo)
+                    )
+                )
+
+        g3_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v3.hi + v.v7.hi + g3_abCarry)
+
+        g3_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_abLo + mb.m0.lo)
+
+        g3_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_abLo mb.m0.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_abLo mb.m0.lo)
+                        (Bitwise.complement g3_a1Lo)
+                    )
+                )
+
+        g3_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_abHi + mb.m0.hi + g3_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g3_d1Hi =
+            Bitwise.xor v.v15.lo g3_a1Lo
+
+        g3_d1Lo =
+            Bitwise.xor v.v15.hi g3_a1Hi
+
+        -- c1 = add64(c, d1)
+        g3_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v11.lo + g3_d1Lo)
+
+        g3_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v11.lo g3_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v11.lo g3_d1Lo)
+                        (Bitwise.complement g3_c1Lo)
+                    )
+                )
+
+        g3_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v11.hi + g3_d1Hi + g3_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g3_b1xHi =
+            Bitwise.xor v.v7.hi g3_c1Hi
+
+        g3_b1xLo =
+            Bitwise.xor v.v7.lo g3_c1Lo
+
+        g3_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xHi) (Bitwise.shiftLeftBy 8 g3_b1xLo)
+
+        g3_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xLo) (Bitwise.shiftLeftBy 8 g3_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g3_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1Lo + g3_b1Lo)
+
+        g3_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1Lo g3_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1Lo g3_b1Lo)
+                        (Bitwise.complement g3_a1b1Lo)
+                    )
+                )
+
+        g3_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1Hi + g3_b1Hi + g3_a1b1Carry)
+
+        g3_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Lo + mb.m8.lo)
+
+        g3_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1b1Lo mb.m8.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1b1Lo mb.m8.lo)
+                        (Bitwise.complement g3_a2Lo)
+                    )
+                )
+
+        g3_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Hi + mb.m8.hi + g3_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g3_d2xHi =
+            Bitwise.xor g3_d1Hi g3_a2Hi
+
+        g3_d2xLo =
+            Bitwise.xor g3_d1Lo g3_a2Lo
+
+        g3_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xHi) (Bitwise.shiftLeftBy 16 g3_d2xLo)
+
+        g3_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xLo) (Bitwise.shiftLeftBy 16 g3_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g3_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c1Lo + g3_d2Lo)
+
+        g3_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c1Lo g3_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c1Lo g3_d2Lo)
+                        (Bitwise.complement g3_c2Lo)
+                    )
+                )
+
+        g3_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c1Hi + g3_d2Hi + g3_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g3_b2xHi =
+            Bitwise.xor g3_b1Hi g3_c2Hi
+
+        g3_b2xLo =
+            Bitwise.xor g3_b1Lo g3_c2Lo
+
+        g3_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xHi) (Bitwise.shiftRightZfBy 31 g3_b2xLo)
+
+        g3_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xLo) (Bitwise.shiftRightZfBy 31 g3_b2xHi)
+
+        -- Diagonal G4: a=g0.a, b=g1.b, c=g2.c, d=g3.d, x=m12, y=m2
+        -- a1 = add64(add64(a, b), x)
+        g4_abLo =
+            Bitwise.shiftRightZfBy 0 (g0_a2Lo + g1_b2Lo)
+
+        g4_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a2Lo g1_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a2Lo g1_b2Lo)
+                        (Bitwise.complement g4_abLo)
+                    )
+                )
+
+        g4_abHi =
+            Bitwise.shiftRightZfBy 0 (g0_a2Hi + g1_b2Hi + g4_abCarry)
+
+        g4_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_abLo + mb.m12.lo)
+
+        g4_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_abLo mb.m12.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_abLo mb.m12.lo)
+                        (Bitwise.complement g4_a1Lo)
+                    )
+                )
+
+        g4_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_abHi + mb.m12.hi + g4_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g4_d1Hi =
+            Bitwise.xor g3_d2Lo g4_a1Lo
+
+        g4_d1Lo =
+            Bitwise.xor g3_d2Hi g4_a1Hi
+
+        -- c1 = add64(c, d1)
+        g4_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c2Lo + g4_d1Lo)
+
+        g4_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c2Lo g4_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c2Lo g4_d1Lo)
+                        (Bitwise.complement g4_c1Lo)
+                    )
+                )
+
+        g4_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c2Hi + g4_d1Hi + g4_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g4_b1xHi =
+            Bitwise.xor g1_b2Hi g4_c1Hi
+
+        g4_b1xLo =
+            Bitwise.xor g1_b2Lo g4_c1Lo
+
+        g4_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xHi) (Bitwise.shiftLeftBy 8 g4_b1xLo)
+
+        g4_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xLo) (Bitwise.shiftLeftBy 8 g4_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g4_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1Lo + g4_b1Lo)
+
+        g4_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1Lo g4_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1Lo g4_b1Lo)
+                        (Bitwise.complement g4_a1b1Lo)
+                    )
+                )
+
+        g4_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1Hi + g4_b1Hi + g4_a1b1Carry)
+
+        g4_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Lo + mb.m2.lo)
+
+        g4_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1b1Lo mb.m2.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1b1Lo mb.m2.lo)
+                        (Bitwise.complement g4_a2Lo)
+                    )
+                )
+
+        g4_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Hi + mb.m2.hi + g4_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g4_d2xHi =
+            Bitwise.xor g4_d1Hi g4_a2Hi
+
+        g4_d2xLo =
+            Bitwise.xor g4_d1Lo g4_a2Lo
+
+        g4_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xHi) (Bitwise.shiftLeftBy 16 g4_d2xLo)
+
+        g4_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xLo) (Bitwise.shiftLeftBy 16 g4_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g4_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_c1Lo + g4_d2Lo)
+
+        g4_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_c1Lo g4_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_c1Lo g4_d2Lo)
+                        (Bitwise.complement g4_c2Lo)
+                    )
+                )
+
+        g4_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_c1Hi + g4_d2Hi + g4_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g4_b2xHi =
+            Bitwise.xor g4_b1Hi g4_c2Hi
+
+        g4_b2xLo =
+            Bitwise.xor g4_b1Lo g4_c2Lo
+
+        g4_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xHi) (Bitwise.shiftRightZfBy 31 g4_b2xLo)
+
+        g4_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xLo) (Bitwise.shiftRightZfBy 31 g4_b2xHi)
+
+        -- Diagonal G5: a=g1.a, b=g2.b, c=g3.c, d=g0.d, x=m13, y=m7
+        -- a1 = add64(add64(a, b), x)
+        g5_abLo =
+            Bitwise.shiftRightZfBy 0 (g1_a2Lo + g2_b2Lo)
+
+        g5_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a2Lo g2_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a2Lo g2_b2Lo)
+                        (Bitwise.complement g5_abLo)
+                    )
+                )
+
+        g5_abHi =
+            Bitwise.shiftRightZfBy 0 (g1_a2Hi + g2_b2Hi + g5_abCarry)
+
+        g5_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_abLo + mb.m13.lo)
+
+        g5_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_abLo mb.m13.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_abLo mb.m13.lo)
+                        (Bitwise.complement g5_a1Lo)
+                    )
+                )
+
+        g5_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_abHi + mb.m13.hi + g5_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g5_d1Hi =
+            Bitwise.xor g0_d2Lo g5_a1Lo
+
+        g5_d1Lo =
+            Bitwise.xor g0_d2Hi g5_a1Hi
+
+        -- c1 = add64(c, d1)
+        g5_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c2Lo + g5_d1Lo)
+
+        g5_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c2Lo g5_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c2Lo g5_d1Lo)
+                        (Bitwise.complement g5_c1Lo)
+                    )
+                )
+
+        g5_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c2Hi + g5_d1Hi + g5_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g5_b1xHi =
+            Bitwise.xor g2_b2Hi g5_c1Hi
+
+        g5_b1xLo =
+            Bitwise.xor g2_b2Lo g5_c1Lo
+
+        g5_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xHi) (Bitwise.shiftLeftBy 8 g5_b1xLo)
+
+        g5_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xLo) (Bitwise.shiftLeftBy 8 g5_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g5_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1Lo + g5_b1Lo)
+
+        g5_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1Lo g5_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1Lo g5_b1Lo)
+                        (Bitwise.complement g5_a1b1Lo)
+                    )
+                )
+
+        g5_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1Hi + g5_b1Hi + g5_a1b1Carry)
+
+        g5_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Lo + mb.m7.lo)
+
+        g5_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1b1Lo mb.m7.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1b1Lo mb.m7.lo)
+                        (Bitwise.complement g5_a2Lo)
+                    )
+                )
+
+        g5_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Hi + mb.m7.hi + g5_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g5_d2xHi =
+            Bitwise.xor g5_d1Hi g5_a2Hi
+
+        g5_d2xLo =
+            Bitwise.xor g5_d1Lo g5_a2Lo
+
+        g5_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xHi) (Bitwise.shiftLeftBy 16 g5_d2xLo)
+
+        g5_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xLo) (Bitwise.shiftLeftBy 16 g5_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g5_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_c1Lo + g5_d2Lo)
+
+        g5_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_c1Lo g5_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_c1Lo g5_d2Lo)
+                        (Bitwise.complement g5_c2Lo)
+                    )
+                )
+
+        g5_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_c1Hi + g5_d2Hi + g5_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g5_b2xHi =
+            Bitwise.xor g5_b1Hi g5_c2Hi
+
+        g5_b2xLo =
+            Bitwise.xor g5_b1Lo g5_c2Lo
+
+        g5_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xHi) (Bitwise.shiftRightZfBy 31 g5_b2xLo)
+
+        g5_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xLo) (Bitwise.shiftRightZfBy 31 g5_b2xHi)
+
+        -- Diagonal G6: a=g2.a, b=g3.b, c=g0.c, d=g1.d, x=m1, y=m4
+        -- a1 = add64(add64(a, b), x)
+        g6_abLo =
+            Bitwise.shiftRightZfBy 0 (g2_a2Lo + g3_b2Lo)
+
+        g6_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a2Lo g3_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a2Lo g3_b2Lo)
+                        (Bitwise.complement g6_abLo)
+                    )
+                )
+
+        g6_abHi =
+            Bitwise.shiftRightZfBy 0 (g2_a2Hi + g3_b2Hi + g6_abCarry)
+
+        g6_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_abLo + mb.m1.lo)
+
+        g6_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_abLo mb.m1.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_abLo mb.m1.lo)
+                        (Bitwise.complement g6_a1Lo)
+                    )
+                )
+
+        g6_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_abHi + mb.m1.hi + g6_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g6_d1Hi =
+            Bitwise.xor g1_d2Lo g6_a1Lo
+
+        g6_d1Lo =
+            Bitwise.xor g1_d2Hi g6_a1Hi
+
+        -- c1 = add64(c, d1)
+        g6_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c2Lo + g6_d1Lo)
+
+        g6_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c2Lo g6_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c2Lo g6_d1Lo)
+                        (Bitwise.complement g6_c1Lo)
+                    )
+                )
+
+        g6_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c2Hi + g6_d1Hi + g6_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g6_b1xHi =
+            Bitwise.xor g3_b2Hi g6_c1Hi
+
+        g6_b1xLo =
+            Bitwise.xor g3_b2Lo g6_c1Lo
+
+        g6_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xHi) (Bitwise.shiftLeftBy 8 g6_b1xLo)
+
+        g6_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xLo) (Bitwise.shiftLeftBy 8 g6_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g6_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1Lo + g6_b1Lo)
+
+        g6_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1Lo g6_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1Lo g6_b1Lo)
+                        (Bitwise.complement g6_a1b1Lo)
+                    )
+                )
+
+        g6_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1Hi + g6_b1Hi + g6_a1b1Carry)
+
+        g6_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Lo + mb.m4.lo)
+
+        g6_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1b1Lo mb.m4.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1b1Lo mb.m4.lo)
+                        (Bitwise.complement g6_a2Lo)
+                    )
+                )
+
+        g6_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Hi + mb.m4.hi + g6_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g6_d2xHi =
+            Bitwise.xor g6_d1Hi g6_a2Hi
+
+        g6_d2xLo =
+            Bitwise.xor g6_d1Lo g6_a2Lo
+
+        g6_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xHi) (Bitwise.shiftLeftBy 16 g6_d2xLo)
+
+        g6_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xLo) (Bitwise.shiftLeftBy 16 g6_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g6_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_c1Lo + g6_d2Lo)
+
+        g6_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_c1Lo g6_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_c1Lo g6_d2Lo)
+                        (Bitwise.complement g6_c2Lo)
+                    )
+                )
+
+        g6_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_c1Hi + g6_d2Hi + g6_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g6_b2xHi =
+            Bitwise.xor g6_b1Hi g6_c2Hi
+
+        g6_b2xLo =
+            Bitwise.xor g6_b1Lo g6_c2Lo
+
+        g6_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xHi) (Bitwise.shiftRightZfBy 31 g6_b2xLo)
+
+        g6_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xLo) (Bitwise.shiftRightZfBy 31 g6_b2xHi)
+
+        -- Diagonal G7: a=g3.a, b=g0.b, c=g1.c, d=g2.d, x=m10, y=m5
+        -- a1 = add64(add64(a, b), x)
+        g7_abLo =
+            Bitwise.shiftRightZfBy 0 (g3_a2Lo + g0_b2Lo)
+
+        g7_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a2Lo g0_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a2Lo g0_b2Lo)
+                        (Bitwise.complement g7_abLo)
+                    )
+                )
+
+        g7_abHi =
+            Bitwise.shiftRightZfBy 0 (g3_a2Hi + g0_b2Hi + g7_abCarry)
+
+        g7_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_abLo + mb.m10.lo)
+
+        g7_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_abLo mb.m10.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_abLo mb.m10.lo)
+                        (Bitwise.complement g7_a1Lo)
+                    )
+                )
+
+        g7_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_abHi + mb.m10.hi + g7_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g7_d1Hi =
+            Bitwise.xor g2_d2Lo g7_a1Lo
+
+        g7_d1Lo =
+            Bitwise.xor g2_d2Hi g7_a1Hi
+
+        -- c1 = add64(c, d1)
+        g7_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c2Lo + g7_d1Lo)
+
+        g7_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c2Lo g7_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c2Lo g7_d1Lo)
+                        (Bitwise.complement g7_c1Lo)
+                    )
+                )
+
+        g7_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c2Hi + g7_d1Hi + g7_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g7_b1xHi =
+            Bitwise.xor g0_b2Hi g7_c1Hi
+
+        g7_b1xLo =
+            Bitwise.xor g0_b2Lo g7_c1Lo
+
+        g7_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xHi) (Bitwise.shiftLeftBy 8 g7_b1xLo)
+
+        g7_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xLo) (Bitwise.shiftLeftBy 8 g7_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g7_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1Lo + g7_b1Lo)
+
+        g7_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1Lo g7_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1Lo g7_b1Lo)
+                        (Bitwise.complement g7_a1b1Lo)
+                    )
+                )
+
+        g7_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1Hi + g7_b1Hi + g7_a1b1Carry)
+
+        g7_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Lo + mb.m5.lo)
+
+        g7_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1b1Lo mb.m5.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1b1Lo mb.m5.lo)
+                        (Bitwise.complement g7_a2Lo)
+                    )
+                )
+
+        g7_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Hi + mb.m5.hi + g7_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g7_d2xHi =
+            Bitwise.xor g7_d1Hi g7_a2Hi
+
+        g7_d2xLo =
+            Bitwise.xor g7_d1Lo g7_a2Lo
+
+        g7_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xHi) (Bitwise.shiftLeftBy 16 g7_d2xLo)
+
+        g7_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xLo) (Bitwise.shiftLeftBy 16 g7_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g7_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_c1Lo + g7_d2Lo)
+
+        g7_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_c1Lo g7_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_c1Lo g7_d2Lo)
+                        (Bitwise.complement g7_c2Lo)
+                    )
+                )
+
+        g7_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_c1Hi + g7_d2Hi + g7_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g7_b2xHi =
+            Bitwise.xor g7_b1Hi g7_c2Hi
+
+        g7_b2xLo =
+            Bitwise.xor g7_b1Lo g7_c2Lo
+
+        g7_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xHi) (Bitwise.shiftRightZfBy 31 g7_b2xLo)
+
+        g7_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
+
     in
-    { v0 = g4.a
-    , v1 = g5.a
-    , v2 = g6.a
-    , v3 = g7.a
-    , v4 = g7.b
-    , v5 = g4.b
-    , v6 = g5.b
-    , v7 = g6.b
-    , v8 = g6.c
-    , v9 = g7.c
-    , v10 = g4.c
-    , v11 = g5.c
-    , v12 = g5.d
-    , v13 = g6.d
-    , v14 = g7.d
-    , v15 = g4.d
+    { v0 = { hi = g4_a2Hi, lo = g4_a2Lo }
+    , v1 = { hi = g5_a2Hi, lo = g5_a2Lo }
+    , v2 = { hi = g6_a2Hi, lo = g6_a2Lo }
+    , v3 = { hi = g7_a2Hi, lo = g7_a2Lo }
+    , v4 = { hi = g7_b2Hi, lo = g7_b2Lo }
+    , v5 = { hi = g4_b2Hi, lo = g4_b2Lo }
+    , v6 = { hi = g5_b2Hi, lo = g5_b2Lo }
+    , v7 = { hi = g6_b2Hi, lo = g6_b2Lo }
+    , v8 = { hi = g6_c2Hi, lo = g6_c2Lo }
+    , v9 = { hi = g7_c2Hi, lo = g7_c2Lo }
+    , v10 = { hi = g4_c2Hi, lo = g4_c2Lo }
+    , v11 = { hi = g5_c2Hi, lo = g5_c2Lo }
+    , v12 = { hi = g5_d2Hi, lo = g5_d2Lo }
+    , v13 = { hi = g6_d2Hi, lo = g6_d2Lo }
+    , v14 = { hi = g7_d2Hi, lo = g7_d2Lo }
+    , v15 = { hi = g4_d2Hi, lo = g4_d2Lo }
     }
 
 
@@ -681,46 +10977,1199 @@ round8 mb v =
 round9 : U64MessageBlock -> WorkingVector -> WorkingVector
 round9 mb v =
     let
-        g0 =
-            g v.v0 v.v4 v.v8 v.v12 mb.m10 mb.m2
+        -- Column G0: a=v0, b=v4, c=v8, d=v12, x=m10, y=m2
+        -- a1 = add64(add64(a, b), x)
+        g0_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v0.lo + v.v4.lo)
 
-        g1 =
-            g v.v1 v.v5 v.v9 v.v13 mb.m8 mb.m4
+        g0_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v0.lo v.v4.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v0.lo v.v4.lo)
+                        (Bitwise.complement g0_abLo)
+                    )
+                )
 
-        g2 =
-            g v.v2 v.v6 v.v10 v.v14 mb.m7 mb.m6
+        g0_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v0.hi + v.v4.hi + g0_abCarry)
 
-        g3 =
-            g v.v3 v.v7 v.v11 v.v15 mb.m1 mb.m5
+        g0_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_abLo + mb.m10.lo)
 
-        g4 =
-            g g0.a g1.b g2.c g3.d mb.m15 mb.m11
+        g0_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_abLo mb.m10.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_abLo mb.m10.lo)
+                        (Bitwise.complement g0_a1Lo)
+                    )
+                )
 
-        g5 =
-            g g1.a g2.b g3.c g0.d mb.m9 mb.m14
+        g0_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_abHi + mb.m10.hi + g0_a1Carry)
 
-        g6 =
-            g g2.a g3.b g0.c g1.d mb.m3 mb.m12
+        -- d1 = rotr32(xor64(d, a1))
+        g0_d1Hi =
+            Bitwise.xor v.v12.lo g0_a1Lo
 
-        g7 =
-            g g3.a g0.b g1.c g2.d mb.m13 mb.m0
+        g0_d1Lo =
+            Bitwise.xor v.v12.hi g0_a1Hi
+
+        -- c1 = add64(c, d1)
+        g0_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v8.lo + g0_d1Lo)
+
+        g0_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v8.lo g0_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v8.lo g0_d1Lo)
+                        (Bitwise.complement g0_c1Lo)
+                    )
+                )
+
+        g0_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v8.hi + g0_d1Hi + g0_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g0_b1xHi =
+            Bitwise.xor v.v4.hi g0_c1Hi
+
+        g0_b1xLo =
+            Bitwise.xor v.v4.lo g0_c1Lo
+
+        g0_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xHi) (Bitwise.shiftLeftBy 8 g0_b1xLo)
+
+        g0_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g0_b1xLo) (Bitwise.shiftLeftBy 8 g0_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g0_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1Lo + g0_b1Lo)
+
+        g0_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1Lo g0_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1Lo g0_b1Lo)
+                        (Bitwise.complement g0_a1b1Lo)
+                    )
+                )
+
+        g0_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1Hi + g0_b1Hi + g0_a1b1Carry)
+
+        g0_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Lo + mb.m2.lo)
+
+        g0_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a1b1Lo mb.m2.lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a1b1Lo mb.m2.lo)
+                        (Bitwise.complement g0_a2Lo)
+                    )
+                )
+
+        g0_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_a1b1Hi + mb.m2.hi + g0_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g0_d2xHi =
+            Bitwise.xor g0_d1Hi g0_a2Hi
+
+        g0_d2xLo =
+            Bitwise.xor g0_d1Lo g0_a2Lo
+
+        g0_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xHi) (Bitwise.shiftLeftBy 16 g0_d2xLo)
+
+        g0_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g0_d2xLo) (Bitwise.shiftLeftBy 16 g0_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g0_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c1Lo + g0_d2Lo)
+
+        g0_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c1Lo g0_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c1Lo g0_d2Lo)
+                        (Bitwise.complement g0_c2Lo)
+                    )
+                )
+
+        g0_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c1Hi + g0_d2Hi + g0_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g0_b2xHi =
+            Bitwise.xor g0_b1Hi g0_c2Hi
+
+        g0_b2xLo =
+            Bitwise.xor g0_b1Lo g0_c2Lo
+
+        g0_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xHi) (Bitwise.shiftRightZfBy 31 g0_b2xLo)
+
+        g0_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g0_b2xLo) (Bitwise.shiftRightZfBy 31 g0_b2xHi)
+
+        -- Column G1: a=v1, b=v5, c=v9, d=v13, x=m8, y=m4
+        -- a1 = add64(add64(a, b), x)
+        g1_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v1.lo + v.v5.lo)
+
+        g1_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v1.lo v.v5.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v1.lo v.v5.lo)
+                        (Bitwise.complement g1_abLo)
+                    )
+                )
+
+        g1_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v1.hi + v.v5.hi + g1_abCarry)
+
+        g1_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_abLo + mb.m8.lo)
+
+        g1_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_abLo mb.m8.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_abLo mb.m8.lo)
+                        (Bitwise.complement g1_a1Lo)
+                    )
+                )
+
+        g1_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_abHi + mb.m8.hi + g1_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g1_d1Hi =
+            Bitwise.xor v.v13.lo g1_a1Lo
+
+        g1_d1Lo =
+            Bitwise.xor v.v13.hi g1_a1Hi
+
+        -- c1 = add64(c, d1)
+        g1_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v9.lo + g1_d1Lo)
+
+        g1_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v9.lo g1_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v9.lo g1_d1Lo)
+                        (Bitwise.complement g1_c1Lo)
+                    )
+                )
+
+        g1_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v9.hi + g1_d1Hi + g1_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g1_b1xHi =
+            Bitwise.xor v.v5.hi g1_c1Hi
+
+        g1_b1xLo =
+            Bitwise.xor v.v5.lo g1_c1Lo
+
+        g1_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xHi) (Bitwise.shiftLeftBy 8 g1_b1xLo)
+
+        g1_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g1_b1xLo) (Bitwise.shiftLeftBy 8 g1_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g1_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1Lo + g1_b1Lo)
+
+        g1_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1Lo g1_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1Lo g1_b1Lo)
+                        (Bitwise.complement g1_a1b1Lo)
+                    )
+                )
+
+        g1_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1Hi + g1_b1Hi + g1_a1b1Carry)
+
+        g1_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Lo + mb.m4.lo)
+
+        g1_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a1b1Lo mb.m4.lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a1b1Lo mb.m4.lo)
+                        (Bitwise.complement g1_a2Lo)
+                    )
+                )
+
+        g1_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_a1b1Hi + mb.m4.hi + g1_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g1_d2xHi =
+            Bitwise.xor g1_d1Hi g1_a2Hi
+
+        g1_d2xLo =
+            Bitwise.xor g1_d1Lo g1_a2Lo
+
+        g1_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xHi) (Bitwise.shiftLeftBy 16 g1_d2xLo)
+
+        g1_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g1_d2xLo) (Bitwise.shiftLeftBy 16 g1_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g1_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c1Lo + g1_d2Lo)
+
+        g1_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c1Lo g1_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c1Lo g1_d2Lo)
+                        (Bitwise.complement g1_c2Lo)
+                    )
+                )
+
+        g1_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c1Hi + g1_d2Hi + g1_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g1_b2xHi =
+            Bitwise.xor g1_b1Hi g1_c2Hi
+
+        g1_b2xLo =
+            Bitwise.xor g1_b1Lo g1_c2Lo
+
+        g1_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xHi) (Bitwise.shiftRightZfBy 31 g1_b2xLo)
+
+        g1_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g1_b2xLo) (Bitwise.shiftRightZfBy 31 g1_b2xHi)
+
+        -- Column G2: a=v2, b=v6, c=v10, d=v14, x=m7, y=m6
+        -- a1 = add64(add64(a, b), x)
+        g2_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v2.lo + v.v6.lo)
+
+        g2_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v2.lo v.v6.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v2.lo v.v6.lo)
+                        (Bitwise.complement g2_abLo)
+                    )
+                )
+
+        g2_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v2.hi + v.v6.hi + g2_abCarry)
+
+        g2_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_abLo + mb.m7.lo)
+
+        g2_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_abLo mb.m7.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_abLo mb.m7.lo)
+                        (Bitwise.complement g2_a1Lo)
+                    )
+                )
+
+        g2_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_abHi + mb.m7.hi + g2_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g2_d1Hi =
+            Bitwise.xor v.v14.lo g2_a1Lo
+
+        g2_d1Lo =
+            Bitwise.xor v.v14.hi g2_a1Hi
+
+        -- c1 = add64(c, d1)
+        g2_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v10.lo + g2_d1Lo)
+
+        g2_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v10.lo g2_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v10.lo g2_d1Lo)
+                        (Bitwise.complement g2_c1Lo)
+                    )
+                )
+
+        g2_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v10.hi + g2_d1Hi + g2_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g2_b1xHi =
+            Bitwise.xor v.v6.hi g2_c1Hi
+
+        g2_b1xLo =
+            Bitwise.xor v.v6.lo g2_c1Lo
+
+        g2_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xHi) (Bitwise.shiftLeftBy 8 g2_b1xLo)
+
+        g2_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g2_b1xLo) (Bitwise.shiftLeftBy 8 g2_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g2_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1Lo + g2_b1Lo)
+
+        g2_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1Lo g2_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1Lo g2_b1Lo)
+                        (Bitwise.complement g2_a1b1Lo)
+                    )
+                )
+
+        g2_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1Hi + g2_b1Hi + g2_a1b1Carry)
+
+        g2_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Lo + mb.m6.lo)
+
+        g2_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a1b1Lo mb.m6.lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a1b1Lo mb.m6.lo)
+                        (Bitwise.complement g2_a2Lo)
+                    )
+                )
+
+        g2_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_a1b1Hi + mb.m6.hi + g2_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g2_d2xHi =
+            Bitwise.xor g2_d1Hi g2_a2Hi
+
+        g2_d2xLo =
+            Bitwise.xor g2_d1Lo g2_a2Lo
+
+        g2_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xHi) (Bitwise.shiftLeftBy 16 g2_d2xLo)
+
+        g2_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g2_d2xLo) (Bitwise.shiftLeftBy 16 g2_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g2_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c1Lo + g2_d2Lo)
+
+        g2_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c1Lo g2_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c1Lo g2_d2Lo)
+                        (Bitwise.complement g2_c2Lo)
+                    )
+                )
+
+        g2_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c1Hi + g2_d2Hi + g2_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g2_b2xHi =
+            Bitwise.xor g2_b1Hi g2_c2Hi
+
+        g2_b2xLo =
+            Bitwise.xor g2_b1Lo g2_c2Lo
+
+        g2_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xHi) (Bitwise.shiftRightZfBy 31 g2_b2xLo)
+
+        g2_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g2_b2xLo) (Bitwise.shiftRightZfBy 31 g2_b2xHi)
+
+        -- Column G3: a=v3, b=v7, c=v11, d=v15, x=m1, y=m5
+        -- a1 = add64(add64(a, b), x)
+        g3_abLo =
+            Bitwise.shiftRightZfBy 0 (v.v3.lo + v.v7.lo)
+
+        g3_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v3.lo v.v7.lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v3.lo v.v7.lo)
+                        (Bitwise.complement g3_abLo)
+                    )
+                )
+
+        g3_abHi =
+            Bitwise.shiftRightZfBy 0 (v.v3.hi + v.v7.hi + g3_abCarry)
+
+        g3_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_abLo + mb.m1.lo)
+
+        g3_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_abLo mb.m1.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_abLo mb.m1.lo)
+                        (Bitwise.complement g3_a1Lo)
+                    )
+                )
+
+        g3_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_abHi + mb.m1.hi + g3_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g3_d1Hi =
+            Bitwise.xor v.v15.lo g3_a1Lo
+
+        g3_d1Lo =
+            Bitwise.xor v.v15.hi g3_a1Hi
+
+        -- c1 = add64(c, d1)
+        g3_c1Lo =
+            Bitwise.shiftRightZfBy 0 (v.v11.lo + g3_d1Lo)
+
+        g3_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and v.v11.lo g3_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or v.v11.lo g3_d1Lo)
+                        (Bitwise.complement g3_c1Lo)
+                    )
+                )
+
+        g3_c1Hi =
+            Bitwise.shiftRightZfBy 0 (v.v11.hi + g3_d1Hi + g3_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g3_b1xHi =
+            Bitwise.xor v.v7.hi g3_c1Hi
+
+        g3_b1xLo =
+            Bitwise.xor v.v7.lo g3_c1Lo
+
+        g3_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xHi) (Bitwise.shiftLeftBy 8 g3_b1xLo)
+
+        g3_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g3_b1xLo) (Bitwise.shiftLeftBy 8 g3_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g3_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1Lo + g3_b1Lo)
+
+        g3_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1Lo g3_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1Lo g3_b1Lo)
+                        (Bitwise.complement g3_a1b1Lo)
+                    )
+                )
+
+        g3_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1Hi + g3_b1Hi + g3_a1b1Carry)
+
+        g3_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Lo + mb.m5.lo)
+
+        g3_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a1b1Lo mb.m5.lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a1b1Lo mb.m5.lo)
+                        (Bitwise.complement g3_a2Lo)
+                    )
+                )
+
+        g3_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_a1b1Hi + mb.m5.hi + g3_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g3_d2xHi =
+            Bitwise.xor g3_d1Hi g3_a2Hi
+
+        g3_d2xLo =
+            Bitwise.xor g3_d1Lo g3_a2Lo
+
+        g3_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xHi) (Bitwise.shiftLeftBy 16 g3_d2xLo)
+
+        g3_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g3_d2xLo) (Bitwise.shiftLeftBy 16 g3_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g3_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c1Lo + g3_d2Lo)
+
+        g3_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c1Lo g3_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c1Lo g3_d2Lo)
+                        (Bitwise.complement g3_c2Lo)
+                    )
+                )
+
+        g3_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c1Hi + g3_d2Hi + g3_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g3_b2xHi =
+            Bitwise.xor g3_b1Hi g3_c2Hi
+
+        g3_b2xLo =
+            Bitwise.xor g3_b1Lo g3_c2Lo
+
+        g3_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xHi) (Bitwise.shiftRightZfBy 31 g3_b2xLo)
+
+        g3_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g3_b2xLo) (Bitwise.shiftRightZfBy 31 g3_b2xHi)
+
+        -- Diagonal G4: a=g0.a, b=g1.b, c=g2.c, d=g3.d, x=m15, y=m11
+        -- a1 = add64(add64(a, b), x)
+        g4_abLo =
+            Bitwise.shiftRightZfBy 0 (g0_a2Lo + g1_b2Lo)
+
+        g4_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_a2Lo g1_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_a2Lo g1_b2Lo)
+                        (Bitwise.complement g4_abLo)
+                    )
+                )
+
+        g4_abHi =
+            Bitwise.shiftRightZfBy 0 (g0_a2Hi + g1_b2Hi + g4_abCarry)
+
+        g4_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_abLo + mb.m15.lo)
+
+        g4_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_abLo mb.m15.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_abLo mb.m15.lo)
+                        (Bitwise.complement g4_a1Lo)
+                    )
+                )
+
+        g4_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_abHi + mb.m15.hi + g4_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g4_d1Hi =
+            Bitwise.xor g3_d2Lo g4_a1Lo
+
+        g4_d1Lo =
+            Bitwise.xor g3_d2Hi g4_a1Hi
+
+        -- c1 = add64(c, d1)
+        g4_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g2_c2Lo + g4_d1Lo)
+
+        g4_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_c2Lo g4_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_c2Lo g4_d1Lo)
+                        (Bitwise.complement g4_c1Lo)
+                    )
+                )
+
+        g4_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g2_c2Hi + g4_d1Hi + g4_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g4_b1xHi =
+            Bitwise.xor g1_b2Hi g4_c1Hi
+
+        g4_b1xLo =
+            Bitwise.xor g1_b2Lo g4_c1Lo
+
+        g4_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xHi) (Bitwise.shiftLeftBy 8 g4_b1xLo)
+
+        g4_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g4_b1xLo) (Bitwise.shiftLeftBy 8 g4_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g4_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1Lo + g4_b1Lo)
+
+        g4_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1Lo g4_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1Lo g4_b1Lo)
+                        (Bitwise.complement g4_a1b1Lo)
+                    )
+                )
+
+        g4_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1Hi + g4_b1Hi + g4_a1b1Carry)
+
+        g4_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Lo + mb.m11.lo)
+
+        g4_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_a1b1Lo mb.m11.lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_a1b1Lo mb.m11.lo)
+                        (Bitwise.complement g4_a2Lo)
+                    )
+                )
+
+        g4_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_a1b1Hi + mb.m11.hi + g4_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g4_d2xHi =
+            Bitwise.xor g4_d1Hi g4_a2Hi
+
+        g4_d2xLo =
+            Bitwise.xor g4_d1Lo g4_a2Lo
+
+        g4_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xHi) (Bitwise.shiftLeftBy 16 g4_d2xLo)
+
+        g4_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g4_d2xLo) (Bitwise.shiftLeftBy 16 g4_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g4_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g4_c1Lo + g4_d2Lo)
+
+        g4_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g4_c1Lo g4_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g4_c1Lo g4_d2Lo)
+                        (Bitwise.complement g4_c2Lo)
+                    )
+                )
+
+        g4_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g4_c1Hi + g4_d2Hi + g4_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g4_b2xHi =
+            Bitwise.xor g4_b1Hi g4_c2Hi
+
+        g4_b2xLo =
+            Bitwise.xor g4_b1Lo g4_c2Lo
+
+        g4_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xHi) (Bitwise.shiftRightZfBy 31 g4_b2xLo)
+
+        g4_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g4_b2xLo) (Bitwise.shiftRightZfBy 31 g4_b2xHi)
+
+        -- Diagonal G5: a=g1.a, b=g2.b, c=g3.c, d=g0.d, x=m9, y=m14
+        -- a1 = add64(add64(a, b), x)
+        g5_abLo =
+            Bitwise.shiftRightZfBy 0 (g1_a2Lo + g2_b2Lo)
+
+        g5_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_a2Lo g2_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_a2Lo g2_b2Lo)
+                        (Bitwise.complement g5_abLo)
+                    )
+                )
+
+        g5_abHi =
+            Bitwise.shiftRightZfBy 0 (g1_a2Hi + g2_b2Hi + g5_abCarry)
+
+        g5_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_abLo + mb.m9.lo)
+
+        g5_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_abLo mb.m9.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_abLo mb.m9.lo)
+                        (Bitwise.complement g5_a1Lo)
+                    )
+                )
+
+        g5_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_abHi + mb.m9.hi + g5_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g5_d1Hi =
+            Bitwise.xor g0_d2Lo g5_a1Lo
+
+        g5_d1Lo =
+            Bitwise.xor g0_d2Hi g5_a1Hi
+
+        -- c1 = add64(c, d1)
+        g5_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g3_c2Lo + g5_d1Lo)
+
+        g5_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_c2Lo g5_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_c2Lo g5_d1Lo)
+                        (Bitwise.complement g5_c1Lo)
+                    )
+                )
+
+        g5_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g3_c2Hi + g5_d1Hi + g5_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g5_b1xHi =
+            Bitwise.xor g2_b2Hi g5_c1Hi
+
+        g5_b1xLo =
+            Bitwise.xor g2_b2Lo g5_c1Lo
+
+        g5_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xHi) (Bitwise.shiftLeftBy 8 g5_b1xLo)
+
+        g5_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g5_b1xLo) (Bitwise.shiftLeftBy 8 g5_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g5_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1Lo + g5_b1Lo)
+
+        g5_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1Lo g5_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1Lo g5_b1Lo)
+                        (Bitwise.complement g5_a1b1Lo)
+                    )
+                )
+
+        g5_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1Hi + g5_b1Hi + g5_a1b1Carry)
+
+        g5_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Lo + mb.m14.lo)
+
+        g5_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_a1b1Lo mb.m14.lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_a1b1Lo mb.m14.lo)
+                        (Bitwise.complement g5_a2Lo)
+                    )
+                )
+
+        g5_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_a1b1Hi + mb.m14.hi + g5_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g5_d2xHi =
+            Bitwise.xor g5_d1Hi g5_a2Hi
+
+        g5_d2xLo =
+            Bitwise.xor g5_d1Lo g5_a2Lo
+
+        g5_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xHi) (Bitwise.shiftLeftBy 16 g5_d2xLo)
+
+        g5_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g5_d2xLo) (Bitwise.shiftLeftBy 16 g5_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g5_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g5_c1Lo + g5_d2Lo)
+
+        g5_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g5_c1Lo g5_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g5_c1Lo g5_d2Lo)
+                        (Bitwise.complement g5_c2Lo)
+                    )
+                )
+
+        g5_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g5_c1Hi + g5_d2Hi + g5_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g5_b2xHi =
+            Bitwise.xor g5_b1Hi g5_c2Hi
+
+        g5_b2xLo =
+            Bitwise.xor g5_b1Lo g5_c2Lo
+
+        g5_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xHi) (Bitwise.shiftRightZfBy 31 g5_b2xLo)
+
+        g5_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g5_b2xLo) (Bitwise.shiftRightZfBy 31 g5_b2xHi)
+
+        -- Diagonal G6: a=g2.a, b=g3.b, c=g0.c, d=g1.d, x=m3, y=m12
+        -- a1 = add64(add64(a, b), x)
+        g6_abLo =
+            Bitwise.shiftRightZfBy 0 (g2_a2Lo + g3_b2Lo)
+
+        g6_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g2_a2Lo g3_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g2_a2Lo g3_b2Lo)
+                        (Bitwise.complement g6_abLo)
+                    )
+                )
+
+        g6_abHi =
+            Bitwise.shiftRightZfBy 0 (g2_a2Hi + g3_b2Hi + g6_abCarry)
+
+        g6_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_abLo + mb.m3.lo)
+
+        g6_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_abLo mb.m3.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_abLo mb.m3.lo)
+                        (Bitwise.complement g6_a1Lo)
+                    )
+                )
+
+        g6_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_abHi + mb.m3.hi + g6_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g6_d1Hi =
+            Bitwise.xor g1_d2Lo g6_a1Lo
+
+        g6_d1Lo =
+            Bitwise.xor g1_d2Hi g6_a1Hi
+
+        -- c1 = add64(c, d1)
+        g6_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g0_c2Lo + g6_d1Lo)
+
+        g6_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g0_c2Lo g6_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g0_c2Lo g6_d1Lo)
+                        (Bitwise.complement g6_c1Lo)
+                    )
+                )
+
+        g6_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g0_c2Hi + g6_d1Hi + g6_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g6_b1xHi =
+            Bitwise.xor g3_b2Hi g6_c1Hi
+
+        g6_b1xLo =
+            Bitwise.xor g3_b2Lo g6_c1Lo
+
+        g6_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xHi) (Bitwise.shiftLeftBy 8 g6_b1xLo)
+
+        g6_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g6_b1xLo) (Bitwise.shiftLeftBy 8 g6_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g6_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1Lo + g6_b1Lo)
+
+        g6_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1Lo g6_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1Lo g6_b1Lo)
+                        (Bitwise.complement g6_a1b1Lo)
+                    )
+                )
+
+        g6_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1Hi + g6_b1Hi + g6_a1b1Carry)
+
+        g6_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Lo + mb.m12.lo)
+
+        g6_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_a1b1Lo mb.m12.lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_a1b1Lo mb.m12.lo)
+                        (Bitwise.complement g6_a2Lo)
+                    )
+                )
+
+        g6_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_a1b1Hi + mb.m12.hi + g6_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g6_d2xHi =
+            Bitwise.xor g6_d1Hi g6_a2Hi
+
+        g6_d2xLo =
+            Bitwise.xor g6_d1Lo g6_a2Lo
+
+        g6_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xHi) (Bitwise.shiftLeftBy 16 g6_d2xLo)
+
+        g6_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g6_d2xLo) (Bitwise.shiftLeftBy 16 g6_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g6_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g6_c1Lo + g6_d2Lo)
+
+        g6_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g6_c1Lo g6_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g6_c1Lo g6_d2Lo)
+                        (Bitwise.complement g6_c2Lo)
+                    )
+                )
+
+        g6_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g6_c1Hi + g6_d2Hi + g6_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g6_b2xHi =
+            Bitwise.xor g6_b1Hi g6_c2Hi
+
+        g6_b2xLo =
+            Bitwise.xor g6_b1Lo g6_c2Lo
+
+        g6_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xHi) (Bitwise.shiftRightZfBy 31 g6_b2xLo)
+
+        g6_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g6_b2xLo) (Bitwise.shiftRightZfBy 31 g6_b2xHi)
+
+        -- Diagonal G7: a=g3.a, b=g0.b, c=g1.c, d=g2.d, x=m13, y=m0
+        -- a1 = add64(add64(a, b), x)
+        g7_abLo =
+            Bitwise.shiftRightZfBy 0 (g3_a2Lo + g0_b2Lo)
+
+        g7_abCarry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g3_a2Lo g0_b2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g3_a2Lo g0_b2Lo)
+                        (Bitwise.complement g7_abLo)
+                    )
+                )
+
+        g7_abHi =
+            Bitwise.shiftRightZfBy 0 (g3_a2Hi + g0_b2Hi + g7_abCarry)
+
+        g7_a1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_abLo + mb.m13.lo)
+
+        g7_a1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_abLo mb.m13.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_abLo mb.m13.lo)
+                        (Bitwise.complement g7_a1Lo)
+                    )
+                )
+
+        g7_a1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_abHi + mb.m13.hi + g7_a1Carry)
+
+        -- d1 = rotr32(xor64(d, a1))
+        g7_d1Hi =
+            Bitwise.xor g2_d2Lo g7_a1Lo
+
+        g7_d1Lo =
+            Bitwise.xor g2_d2Hi g7_a1Hi
+
+        -- c1 = add64(c, d1)
+        g7_c1Lo =
+            Bitwise.shiftRightZfBy 0 (g1_c2Lo + g7_d1Lo)
+
+        g7_c1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g1_c2Lo g7_d1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g1_c2Lo g7_d1Lo)
+                        (Bitwise.complement g7_c1Lo)
+                    )
+                )
+
+        g7_c1Hi =
+            Bitwise.shiftRightZfBy 0 (g1_c2Hi + g7_d1Hi + g7_c1Carry)
+
+        -- b1 = rotr24(xor64(b, c1))
+        g7_b1xHi =
+            Bitwise.xor g0_b2Hi g7_c1Hi
+
+        g7_b1xLo =
+            Bitwise.xor g0_b2Lo g7_c1Lo
+
+        g7_b1Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xHi) (Bitwise.shiftLeftBy 8 g7_b1xLo)
+
+        g7_b1Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 24 g7_b1xLo) (Bitwise.shiftLeftBy 8 g7_b1xHi)
+
+        -- a2 = add64(add64(a1, b1), y)
+        g7_a1b1Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1Lo + g7_b1Lo)
+
+        g7_a1b1Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1Lo g7_b1Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1Lo g7_b1Lo)
+                        (Bitwise.complement g7_a1b1Lo)
+                    )
+                )
+
+        g7_a1b1Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1Hi + g7_b1Hi + g7_a1b1Carry)
+
+        g7_a2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Lo + mb.m0.lo)
+
+        g7_a2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_a1b1Lo mb.m0.lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_a1b1Lo mb.m0.lo)
+                        (Bitwise.complement g7_a2Lo)
+                    )
+                )
+
+        g7_a2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_a1b1Hi + mb.m0.hi + g7_a2Carry)
+
+        -- d2 = rotr16(xor64(d1, a2))
+        g7_d2xHi =
+            Bitwise.xor g7_d1Hi g7_a2Hi
+
+        g7_d2xLo =
+            Bitwise.xor g7_d1Lo g7_a2Lo
+
+        g7_d2Hi =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xHi) (Bitwise.shiftLeftBy 16 g7_d2xLo)
+
+        g7_d2Lo =
+            Bitwise.or (Bitwise.shiftRightZfBy 16 g7_d2xLo) (Bitwise.shiftLeftBy 16 g7_d2xHi)
+
+        -- c2 = add64(c1, d2)
+        g7_c2Lo =
+            Bitwise.shiftRightZfBy 0 (g7_c1Lo + g7_d2Lo)
+
+        g7_c2Carry =
+            Bitwise.shiftRightZfBy 31
+                (Bitwise.or
+                    (Bitwise.and g7_c1Lo g7_d2Lo)
+                    (Bitwise.and
+                        (Bitwise.or g7_c1Lo g7_d2Lo)
+                        (Bitwise.complement g7_c2Lo)
+                    )
+                )
+
+        g7_c2Hi =
+            Bitwise.shiftRightZfBy 0 (g7_c1Hi + g7_d2Hi + g7_c2Carry)
+
+        -- b2 = rotr63(xor64(b1, c2))
+        g7_b2xHi =
+            Bitwise.xor g7_b1Hi g7_c2Hi
+
+        g7_b2xLo =
+            Bitwise.xor g7_b1Lo g7_c2Lo
+
+        g7_b2Hi =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xHi) (Bitwise.shiftRightZfBy 31 g7_b2xLo)
+
+        g7_b2Lo =
+            Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
+
     in
-    { v0 = g4.a
-    , v1 = g5.a
-    , v2 = g6.a
-    , v3 = g7.a
-    , v4 = g7.b
-    , v5 = g4.b
-    , v6 = g5.b
-    , v7 = g6.b
-    , v8 = g6.c
-    , v9 = g7.c
-    , v10 = g4.c
-    , v11 = g5.c
-    , v12 = g5.d
-    , v13 = g6.d
-    , v14 = g7.d
-    , v15 = g4.d
+    { v0 = { hi = g4_a2Hi, lo = g4_a2Lo }
+    , v1 = { hi = g5_a2Hi, lo = g5_a2Lo }
+    , v2 = { hi = g6_a2Hi, lo = g6_a2Lo }
+    , v3 = { hi = g7_a2Hi, lo = g7_a2Lo }
+    , v4 = { hi = g7_b2Hi, lo = g7_b2Lo }
+    , v5 = { hi = g4_b2Hi, lo = g4_b2Lo }
+    , v6 = { hi = g5_b2Hi, lo = g5_b2Lo }
+    , v7 = { hi = g6_b2Hi, lo = g6_b2Lo }
+    , v8 = { hi = g6_c2Hi, lo = g6_c2Lo }
+    , v9 = { hi = g7_c2Hi, lo = g7_c2Lo }
+    , v10 = { hi = g4_c2Hi, lo = g4_c2Lo }
+    , v11 = { hi = g5_c2Hi, lo = g5_c2Lo }
+    , v12 = { hi = g5_d2Hi, lo = g5_d2Lo }
+    , v13 = { hi = g6_d2Hi, lo = g6_d2Lo }
+    , v14 = { hi = g7_d2Hi, lo = g7_d2Lo }
+    , v15 = { hi = g4_d2Hi, lo = g4_d2Lo }
     }
 
 
