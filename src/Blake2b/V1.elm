@@ -46,7 +46,7 @@ Base (V1):
 
 import Bitwise
 import Blake2b.Internal.Constants exposing (..)
-import Blake2b.Internal.Decode exposing (MessageBlock, blockDecoder, encodeDigest)
+import Blake2b.Internal.DecodeV1 exposing (MessageBlock, blockDecoder, encodeDigest)
 import Bytes exposing (Bytes, Endianness(..))
 import Bytes.Decode as Decode
 import Bytes.Encode as Encode
