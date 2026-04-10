@@ -14,6 +14,7 @@
         "bench:test": "cd bench && elm-test",
         "bench:build": "cd bench && elm make src/Bench.elm --output=/dev/null"
     },
+    "packageManager": "pnpm@10",
     "pnpm": {
         "onlyBuiltDependencies": [
             "elm",
