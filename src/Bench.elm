@@ -1,11 +1,11 @@
-module Bench exposing (v1_64, v1_256, v1_1024, v1_4096)
+module Bench exposing (v1_1024, v1_256, v1_4096, v1_64)
 
 {-| Benchmark functions for BLAKE2b.
 
 Each function takes `()` and computes BLAKE2b-512 on a pre-built input of the given size.
 Useful with elm-bench:
 
-    elm-bench -f Bench.v1_64 -f Bench.v1_256 -f Bench.v1_1024 -f Bench.v1_4096 "()"
+    elm - bench -f Bench.v1_64 -f Bench.v1_256 -f Bench.v1_1024 -f Bench.v1_4096 "()"
 
 -}
 

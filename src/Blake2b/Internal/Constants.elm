@@ -1,6 +1,20 @@
 module Blake2b.Internal.Constants exposing
-    ( iv0Hi, iv0Lo, iv1Hi, iv1Lo, iv2Hi, iv2Lo, iv3Hi, iv3Lo
-    , iv4Hi, iv4Lo, iv5Hi, iv5Lo, iv6Hi, iv6Lo, iv7Hi, iv7Lo
+    ( iv0Hi
+    , iv0Lo
+    , iv1Hi
+    , iv1Lo
+    , iv2Hi
+    , iv2Lo
+    , iv3Hi
+    , iv3Lo
+    , iv4Hi
+    , iv4Lo
+    , iv5Hi
+    , iv5Lo
+    , iv6Hi
+    , iv6Lo
+    , iv7Hi
+    , iv7Lo
     )
 
 {-| BLAKE2b initialization vectors — first 64 bits of fractional parts
