@@ -52,9 +52,9 @@ These variants were explored early on and later deleted. Results are kept for re
 | Positional | 578,575 | 16% slower |
 | Optimized  | 468,422 | 6% faster |
 
-### Current variants (V1 through V5)
+### Current variants (V1 through V6)
 
-V1 is the Optimized variant renamed. V2-V5 build incrementally on V1.
+V1 is the Optimized variant renamed. V2-V6 build incrementally on V1.
 
 #### 64 bytes (1 block)
 
@@ -65,6 +65,13 @@ V1 is the Optimized variant renamed. V2-V5 build incrementally on V1.
 | V3      |  5,009 | 52% faster |
 | V4      |  4,311 | 59% faster |
 | V5      |  3,708 | 64% faster |
+
+#### 129 bytes (2 blocks, 1-byte partial)
+
+| Variant | ns/run | vs V5     |
+|---------|-------:|-----------|
+| V5      |  6,773 | baseline  |
+| V6      |  6,162 | 9% faster |
 
 #### 1024 bytes (8 blocks)
 
@@ -86,10 +93,12 @@ Compiled JS output size (single module + Elm runtime, via `elm make --output`):
 | V3      | 119,163  | 4,361    |
 | V4      | ~119,000 | ~4,400   |
 | V5      | ~119,000 | ~4,400   |
+| V6      | ~119,000 | ~4,400   |
 
 V2's 10 inlined round functions cause a 2.2x JS bloat. V3 consolidates to one
 round function, bringing size back near V1 with only ~3% perf cost vs V2. V4
-adds flat fields with negligible size impact. V5 changes the decoder, no size impact.
+adds flat fields with negligible size impact. V5/V6 change decoder and padding,
+no significant size impact.
 
 ## Variant Descriptions
 
@@ -210,6 +219,25 @@ Also changes `encodeDigest` from 17 individual Int arguments to 2 arguments
 - Net: ~40 allocations per block decode vs ~55+ closures previously
 - **14% faster than V4** on 64-byte input (3,708 vs 4,311 ns/run)
 
+### V6 (pre-padded input + hoisted zero block)
+
+**Eliminates the pad+re-decode round-trip for partial last blocks.** Previously, when the
+last block was partial (1-127 bytes), the loop would read the partial bytes, call `padBlock`
+(which created `padLen` list cons cells + encoder objects via `List.repeat`), encode to a
+new 128-byte `Bytes`, then re-decode it with a fresh `blockDecoder` call.
+
+V6 pre-pads the input to a 128-byte boundary before entering the decode loop, so the loop
+always reads full blocks with `blockDecoder` in a single continuous pass. Uses `Encode.unsignedInt32 LE 0`
+for padding where possible (4x fewer list allocations than per-byte padding).
+
+Also hoists a `zeroMessageBlock` constant to module level for the empty-input path,
+avoiding encode+decode of 128 zero bytes on every empty hash call.
+
+- Simplifies blockLoop from 3 branches to 2
+- Eliminates O(padLen) List.repeat + encode + full re-decode per partial block
+- **9% faster than V5** on 129-byte input (6,162 vs 6,773 ns/run)
+- No impact on inputs that are exact multiples of 128 bytes
+
 ## Throughput Estimates
 
 Based on 1024-byte benchmarks:
@@ -232,6 +260,7 @@ Based on 1024-byte benchmarks:
 | V3         |            ~250 | Same as V2 + permuted message blocks |
 | V4         |             ~25 | Flat WorkingVectors (1/round) + permuted MessageBlocks |
 | V5         |             ~25 | Same as V4 (decoder overhead reduced separately) |
+| V6         |             ~25 | Same as V5 (partial-block overhead eliminated) |
 
 ## Key Takeaways
 
@@ -269,3 +298,8 @@ Based on 1024-byte benchmarks:
 9. **Fix >9-arg functions everywhere, including decoders.** The block decoder's chained
    helper functions had up to 28 arguments, creating ~55 curried closures per block.
    Restructuring into quarter-block sub-decoders (8 args each) yielded 14% speedup.
+
+10. **Avoid encode+decode round-trips.** The partial-block path was encoding zero-padded
+    bytes then re-decoding them — a full encode+decode cycle per hash. Pre-padding the
+    input once lets the loop always read full blocks in a single pass, yielding 9% on
+    inputs with partial last blocks.

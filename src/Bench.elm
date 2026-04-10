@@ -1,4 +1,4 @@
-module Bench exposing (v1_1024, v1_256, v1_4096, v1_64, v2_1024, v2_256, v2_4096, v2_64)
+module Bench exposing (v1_1024, v1_129, v1_256, v1_4096, v1_64, v2_1024, v2_129, v2_256, v2_4096, v2_64)
 
 {-| Benchmark functions for BLAKE2b.
 
@@ -42,6 +42,11 @@ bytes1024 =
     makeBytes 1024
 
 
+bytes129 : Bytes
+bytes129 =
+    makeBytes 129
+
+
 bytes4096 : Bytes
 bytes4096 =
     makeBytes 4096
@@ -54,6 +59,11 @@ bytes4096 =
 v1_64 : () -> Bytes
 v1_64 () =
     Blake2b.V1.hash512 bytes64
+
+
+v1_129 : () -> Bytes
+v1_129 () =
+    Blake2b.V1.hash512 bytes129
 
 
 v1_256 : () -> Bytes
@@ -78,6 +88,11 @@ v1_4096 () =
 v2_64 : () -> Bytes
 v2_64 () =
     Blake2b.V2.hash512 bytes64
+
+
+v2_129 : () -> Bytes
+v2_129 () =
+    Blake2b.V2.hash512 bytes129
 
 
 v2_256 : () -> Bytes
