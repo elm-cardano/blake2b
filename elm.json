@@ -1,6 +1,6 @@
 {
     "type": "package",
-    "name": "mpizenberg/blake2b",
+    "name": "elm-cardano/blake2b",
     "summary": "Pure Elm BLAKE2b cryptographic hash (RFC 7693)",
     "license": "BSD-3-Clause",
     "version": "1.0.0",

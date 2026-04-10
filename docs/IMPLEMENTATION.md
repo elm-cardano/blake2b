@@ -54,12 +54,12 @@ eliminating ~768 polymorphic calls per block.
 
 **Rotation formulas** (all using `shiftRightZfBy` for unsigned shifts):
 
-| Rotation | resultHi | resultLo |
-|----------|----------|----------|
-| rotr 32  | `lo` | `hi` |
-| rotr 24  | `(hi >>> 24) \| (lo << 8)` | `(lo >>> 24) \| (hi << 8)` |
+| Rotation | resultHi                    | resultLo                    |
+| -------- | --------------------------- | --------------------------- |
+| rotr 32  | `lo`                        | `hi`                        |
+| rotr 24  | `(hi >>> 24) \| (lo << 8)`  | `(lo >>> 24) \| (hi << 8)`  |
 | rotr 16  | `(hi >>> 16) \| (lo << 16)` | `(lo >>> 16) \| (hi << 16)` |
-| rotr 63  | `(hi << 1) \| (lo >>> 31)` | `(lo << 1) \| (hi >>> 31)` |
+| rotr 63  | `(hi << 1) \| (lo >>> 31)`  | `(lo << 1) \| (hi >>> 31)`  |
 
 **Finalization**: `v[14] = complement(IV[6])` on last block (XOR with all-ones).
 
@@ -86,12 +86,12 @@ Apple Silicon). Compiled with `elm make` (no `--optimize`, no elm-optimize-level
 
 ### Early Exploration (deleted variants)
 
-| Variant    | 64B ns/run | 1024B ns/run | Notes |
-|------------|----------:|-----------:|-------|
-| Record     |    16,815 |    115,328 | Baseline. `{hi, lo}` records for U64s |
-| Tuple      |    16,953 |    114,661 | `(hi, lo)` tuples — same speed, slightly larger JS objects |
-| Positional |    20,206 |    141,238 | Raw Int pairs as args — 20% slower despite 20x fewer allocations |
-| Optimized  |    16,222 |    109,032 | Hoisted IVs + specialized rounds — became V1 |
+| Variant    | 64B ns/run | 1024B ns/run | Notes                                                            |
+| ---------- | ---------: | -----------: | ---------------------------------------------------------------- |
+| Record     |     16,815 |      115,328 | Baseline. `{hi, lo}` records for U64s                            |
+| Tuple      |     16,953 |      114,661 | `(hi, lo)` tuples — same speed, slightly larger JS objects       |
+| Positional |     20,206 |      141,238 | Raw Int pairs as args — 20% slower despite 20x fewer allocations |
+| Optimized  |     16,222 |      109,032 | Hoisted IVs + specialized rounds — became V1                     |
 
 **Why Positional was slower**: Its 12-arg `g` function exceeded Elm's 9-arg
 fast path, caused register spilling (~35 locals), and defeated V8's inlining
@@ -144,35 +144,35 @@ empty-input path. Simplifies blockLoop from 3 branches to 2.
 
 ### Benchmark Summary
 
-| Input | V1 ns/run | Best ns/run | Speedup |
-|-------|----------:|------------:|---------|
-| 64B   |    10,389 | 3,708 (V5)  | 64%     |
-| 129B  |     —     | 6,162 (V6)  | 9% vs V5 |
-| 1024B |    71,179 | 27,453 (V4) | 61%     |
+| Input | V1 ns/run | Best ns/run | Speedup  |
+| ----- | --------: | ----------: | -------- |
+| 64B   |    10,389 |  3,708 (V5) | 64%      |
+| 129B  |         — |  6,162 (V6) | 9% vs V5 |
+| 1024B |    71,179 | 27,453 (V4) | 61%      |
 
 ### JS Output Size
 
 | Variant | JS bytes | JS lines |
-|---------|----------|----------|
+| ------- | -------- | -------- |
 | V1      | 112,811  | 4,215    |
 | V2      | 249,264  | 6,824    |
 | V3-V6   | ~119,000 | ~4,400   |
 
 ### Allocation Estimates Per Block
 
-| Stage      | JS objects/block | Main source |
-|------------|----------------:|-------------|
-| Record/V1  |          ~2,100 | U64 records from add64/xor64/rotr in G |
-| Positional |            ~108 | G8 returns + WorkingVector |
-| V2/V3      |            ~250 | WorkingVector U64 fields (16/round × 12) |
-| V4-V6      |             ~25 | Flat WorkingVectors + permuted MessageBlocks |
+| Stage      | JS objects/block | Main source                                  |
+| ---------- | ---------------: | -------------------------------------------- |
+| Record/V1  |           ~2,100 | U64 records from add64/xor64/rotr in G       |
+| Positional |             ~108 | G8 returns + WorkingVector                   |
+| V2/V3      |             ~250 | WorkingVector U64 fields (16/round × 12)     |
+| V4-V6      |              ~25 | Flat WorkingVectors + permuted MessageBlocks |
 
 ### Throughput (1024B benchmarks)
 
-| Variant | ns/run  | KB/s |
-|---------|--------:|-----:|
-| V1      | 71,179  | 14.4 |
-| V4      | 27,453  | 37.3 |
+| Variant | ns/run | KB/s |
+| ------- | -----: | ---: |
+| V1      | 71,179 | 14.4 |
+| V4      | 27,453 | 37.3 |
 
 ## Elm/V8 Performance Lessons
 
@@ -220,6 +220,7 @@ empty-input path. Simplifies blockLoop from 3 branches to 2.
 ## Testing
 
 30 tests covering:
+
 - RFC 7693 vectors (empty string, "abc")
 - Self-test digest (Appendix E) — exercises all digest lengths, keyed + unkeyed,
   input lengths 0-255
