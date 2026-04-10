@@ -2,13 +2,11 @@ module Blake2b exposing (hash, hash512, hash256, hash224)
 
 {-| Pure Elm BLAKE2b implementation (RFC 7693).
 
-This module re-exports the Record variant as the default implementation.
-
 @docs hash, hash512, hash256, hash224
 
 -}
 
-import Blake2b.Record
+import Blake2b.V1
 import Bytes exposing (Bytes)
 
 
@@ -21,25 +19,25 @@ import Bytes exposing (Bytes)
 -}
 hash : { digestLength : Int, key : Bytes, data : Bytes } -> Bytes
 hash =
-    Blake2b.Record.hash
+    Blake2b.V1.hash
 
 
 {-| Compute a 512-bit (64-byte) BLAKE2b hash.
 -}
 hash512 : Bytes -> Bytes
 hash512 =
-    Blake2b.Record.hash512
+    Blake2b.V1.hash512
 
 
 {-| Compute a 256-bit (32-byte) BLAKE2b hash.
 -}
 hash256 : Bytes -> Bytes
 hash256 =
-    Blake2b.Record.hash256
+    Blake2b.V1.hash256
 
 
 {-| Compute a 224-bit (28-byte) BLAKE2b hash.
 -}
 hash224 : Bytes -> Bytes
 hash224 =
-    Blake2b.Record.hash224
+    Blake2b.V1.hash224

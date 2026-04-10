@@ -1,7 +1,7 @@
-module Blake2bPositionalTest exposing (suite)
+module Blake2bV1Test exposing (suite)
 
 import Bitwise
-import Blake2b.Positional exposing (hash, hash224, hash256, hash512)
+import Blake2b.V1 exposing (hash, hash224, hash256, hash512)
 import Bytes exposing (Bytes)
 import Bytes.Encode as Encode
 import Expect
@@ -37,7 +37,7 @@ katKey =
 
 suite : Test
 suite =
-    describe "Blake2b.Positional"
+    describe "Blake2b.V1"
         [ rfcVectors
         , katVectors
         , convenienceFunctions
@@ -173,16 +173,6 @@ convenienceFunctions =
 
 
 {-| Pseudorandom sequence generator from RFC 7693 Appendix E.
-
-    selftest_seq(len, seed):
-        a = 0xDEAD4BAD * seed  (mod 2^32)
-        b = 1
-        for i in 0..len-1:
-            t = a + b  (mod 2^32)
-            a = b
-            b = t
-            out[i] = (t >> 24) & 0xFF
-
 -}
 selftestSeq : Int -> Int -> Bytes
 selftestSeq len seed =
@@ -203,8 +193,6 @@ selftestSeq len seed =
     Encode.encode (Encode.sequence (List.reverse reversedEncoders))
 
 
-{-| Concatenate two Bytes values.
--}
 appendBytes : Bytes -> Bytes -> Bytes
 appendBytes a b =
     Encode.encode
@@ -227,8 +215,6 @@ selfTest =
                     inLens =
                         [ 0, 3, 128, 129, 255, 1024 ]
 
-                    -- For each (outlen, inlen) pair, compute unkeyed and keyed hashes,
-                    -- and concatenate all results.
                     allOutputs =
                         List.foldl
                             (\outlen outerAcc ->
@@ -290,7 +276,6 @@ edgeCases =
                         hash { digestLength = 64, key = katKey, data = sequentialBytes 127 }
                             |> bytesToHex
                 in
-                -- Verify the digest is 128 hex chars (64 bytes)
                 String.length result
                     |> Expect.equal 128
         , test "128 bytes (exactly one block)" <|
@@ -306,13 +291,10 @@ edgeCases =
                         hash { digestLength = 64, key = katKey, data = sequentialBytes 129 }
                             |> bytesToHex
                 in
-                -- Verify the digest is 128 hex chars (64 bytes)
                 String.length result
                     |> Expect.equal 128
         , test "keyed hash with 127-byte message produces correct length" <|
             \_ ->
-                -- With a key, the key occupies the first block, so 127 bytes of data
-                -- means the second block is not full.
                 hash { digestLength = 64, key = katKey, data = sequentialBytes 127 }
                     |> Bytes.width
                     |> Expect.equal 64
@@ -345,7 +327,5 @@ edgeCases =
                         hash { digestLength = 64, key = emptyBytes, data = hexToBytes "616263" }
                             |> bytesToHex
                 in
-                -- The 32-byte digest should NOT be a prefix of the 64-byte digest
-                -- because the digest length is mixed into the parameter block.
                 Expect.notEqual d32 (String.left 64 d64)
         ]
