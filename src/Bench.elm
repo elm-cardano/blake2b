@@ -1,4 +1,4 @@
-module Bench exposing (v1_1024, v1_256, v1_4096, v1_64, v2_1024, v2_256, v2_4096, v2_64, v3_1024, v3_256, v3_4096, v3_64, v4_1024, v4_256, v4_4096, v4_64)
+module Bench exposing (v1_1024, v1_256, v1_4096, v1_64, v2_1024, v2_256, v2_4096, v2_64)
 
 {-| Benchmark functions for BLAKE2b.
 
@@ -15,8 +15,6 @@ elm-bench -f Bench.v1_4096 -f Bench.v2_4096 "()"
 
 import Blake2b.V1
 import Blake2b.V2
-import Blake2b.V3
-import Blake2b.V4
 import Bytes exposing (Bytes)
 import Bytes.Encode as Encode
 
@@ -95,51 +93,3 @@ v2_1024 () =
 v2_4096 : () -> Bytes
 v2_4096 () =
     Blake2b.V2.hash512 bytes4096
-
-
-
--- V3
-
-
-v3_64 : () -> Bytes
-v3_64 () =
-    Blake2b.V3.hash512 bytes64
-
-
-v3_256 : () -> Bytes
-v3_256 () =
-    Blake2b.V3.hash512 bytes256
-
-
-v3_1024 : () -> Bytes
-v3_1024 () =
-    Blake2b.V3.hash512 bytes1024
-
-
-v3_4096 : () -> Bytes
-v3_4096 () =
-    Blake2b.V3.hash512 bytes4096
-
-
-
--- V4
-
-
-v4_64 : () -> Bytes
-v4_64 () =
-    Blake2b.V4.hash512 bytes64
-
-
-v4_256 : () -> Bytes
-v4_256 () =
-    Blake2b.V4.hash512 bytes256
-
-
-v4_1024 : () -> Bytes
-v4_1024 () =
-    Blake2b.V4.hash512 bytes1024
-
-
-v4_4096 : () -> Bytes
-v4_4096 () =
-    Blake2b.V4.hash512 bytes4096
