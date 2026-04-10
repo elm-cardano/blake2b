@@ -12,6 +12,16 @@ No kernel code, no ports, no JS FFI — just Elm.
 elm install elm-cardano/blake2b
 ```
 
+## Development
+
+```sh
+pnpm install
+pnpm test          # run tests
+pnpm review        # run elm-review
+pnpm format:check  # check formatting
+pnpm format        # auto-format
+```
+
 ## Usage
 
 ```elm
