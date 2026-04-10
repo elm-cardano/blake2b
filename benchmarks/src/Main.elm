@@ -42,11 +42,6 @@ bytes1024 =
     makeBytes 1024
 
 
-bytes4096 : Bytes
-bytes4096 =
-    makeBytes 4096
-
-
 suite : Benchmark
 suite =
     describe "BLAKE2b-512"
@@ -64,10 +59,5 @@ suite =
             [ Benchmark.benchmark "Record" (\_ -> Record.hash512 bytes1024)
             , Benchmark.benchmark "Tuple" (\_ -> Tuple.hash512 bytes1024)
             , Benchmark.benchmark "Positional" (\_ -> Positional.hash512 bytes1024)
-            ]
-        , describe "4096 bytes"
-            [ Benchmark.benchmark "Record" (\_ -> Record.hash512 bytes4096)
-            , Benchmark.benchmark "Tuple" (\_ -> Tuple.hash512 bytes4096)
-            , Benchmark.benchmark "Positional" (\_ -> Positional.hash512 bytes4096)
             ]
         ]
