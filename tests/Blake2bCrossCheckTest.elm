@@ -1,5 +1,6 @@
 module Blake2bCrossCheckTest exposing (suite)
 
+import Blake2b.Optimized as Optimized
 import Blake2b.Positional as Positional
 import Blake2b.Record as Record
 import Blake2b.Tuple as Tuple
@@ -57,9 +58,14 @@ crossCheckCase c =
 
         positionalResult =
             Positional.hash config |> bytesToHex
+
+        optimizedResult =
+            Optimized.hash config |> bytesToHex
     in
     [ test (c.label ++ ": Record == Tuple") <|
         \_ -> Expect.equal recordResult tupleResult
     , test (c.label ++ ": Record == Positional") <|
         \_ -> Expect.equal recordResult positionalResult
+    , test (c.label ++ ": Record == Optimized") <|
+        \_ -> Expect.equal recordResult optimizedResult
     ]

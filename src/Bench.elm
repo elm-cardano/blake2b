@@ -1,8 +1,8 @@
 module Bench exposing
-    ( record64, tuple64, positional64
-    , record256, tuple256, positional256
-    , record1024, tuple1024, positional1024
-    , record4096, tuple4096, positional4096
+    ( record64, tuple64, positional64, optimized64
+    , record256, tuple256, positional256, optimized256
+    , record1024, tuple1024, positional1024, optimized1024
+    , record4096, tuple4096, positional4096, optimized4096
     )
 
 {-| Wrapper functions for benchmarking the three BLAKE2b variants with elm-bench.
@@ -12,13 +12,14 @@ using one of the three variants (Record, Tuple, Positional).
 
 Run from the project root with:
 
-    elm-bench -f Bench.record64 -f Bench.tuple64 -f Bench.positional64 "()"
-    elm-bench -f Bench.record256 -f Bench.tuple256 -f Bench.positional256 "()"
-    elm-bench -f Bench.record1024 -f Bench.tuple1024 -f Bench.positional1024 "()"
-    elm-bench -f Bench.record4096 -f Bench.tuple4096 -f Bench.positional4096 "()"
+    elm-bench -f Bench.record64 -f Bench.tuple64 -f Bench.positional64 -f Bench.optimized64 "()"
+    elm-bench -f Bench.record256 -f Bench.tuple256 -f Bench.positional256 -f Bench.optimized256 "()"
+    elm-bench -f Bench.record1024 -f Bench.tuple1024 -f Bench.positional1024 -f Bench.optimized1024 "()"
+    elm-bench -f Bench.record4096 -f Bench.tuple4096 -f Bench.positional4096 -f Bench.optimized4096 "()"
 
 -}
 
+import Blake2b.Optimized as Optimized
 import Blake2b.Positional as Positional
 import Blake2b.Record as Record
 import Blake2b.Tuple as Tuple
@@ -73,6 +74,11 @@ positional64 () =
     Positional.hash512 bytes64
 
 
+optimized64 : () -> Bytes
+optimized64 () =
+    Optimized.hash512 bytes64
+
+
 
 -- 256 bytes
 
@@ -90,6 +96,11 @@ tuple256 () =
 positional256 : () -> Bytes
 positional256 () =
     Positional.hash512 bytes256
+
+
+optimized256 : () -> Bytes
+optimized256 () =
+    Optimized.hash512 bytes256
 
 
 
@@ -111,6 +122,11 @@ positional1024 () =
     Positional.hash512 bytes1024
 
 
+optimized1024 : () -> Bytes
+optimized1024 () =
+    Optimized.hash512 bytes1024
+
+
 
 -- 4096 bytes
 
@@ -128,3 +144,8 @@ tuple4096 () =
 positional4096 : () -> Bytes
 positional4096 () =
     Positional.hash512 bytes4096
+
+
+optimized4096 : () -> Bytes
+optimized4096 () =
+    Optimized.hash512 bytes4096

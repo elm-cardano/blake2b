@@ -2,6 +2,7 @@ module Main exposing (main)
 
 import Benchmark exposing (Benchmark, describe)
 import Benchmark.Runner exposing (BenchmarkProgram, program)
+import Blake2b.Optimized as Optimized
 import Blake2b.Positional as Positional
 import Blake2b.Record as Record
 import Blake2b.Tuple as Tuple
@@ -49,15 +50,18 @@ suite =
             [ Benchmark.benchmark "Record" (\_ -> Record.hash512 bytes64)
             , Benchmark.benchmark "Tuple" (\_ -> Tuple.hash512 bytes64)
             , Benchmark.benchmark "Positional" (\_ -> Positional.hash512 bytes64)
+            , Benchmark.benchmark "Optimized" (\_ -> Optimized.hash512 bytes64)
             ]
         , describe "256 bytes"
             [ Benchmark.benchmark "Record" (\_ -> Record.hash512 bytes256)
             , Benchmark.benchmark "Tuple" (\_ -> Tuple.hash512 bytes256)
             , Benchmark.benchmark "Positional" (\_ -> Positional.hash512 bytes256)
+            , Benchmark.benchmark "Optimized" (\_ -> Optimized.hash512 bytes256)
             ]
         , describe "1024 bytes"
             [ Benchmark.benchmark "Record" (\_ -> Record.hash512 bytes1024)
             , Benchmark.benchmark "Tuple" (\_ -> Tuple.hash512 bytes1024)
             , Benchmark.benchmark "Positional" (\_ -> Positional.hash512 bytes1024)
+            , Benchmark.benchmark "Optimized" (\_ -> Optimized.hash512 bytes1024)
             ]
         ]
