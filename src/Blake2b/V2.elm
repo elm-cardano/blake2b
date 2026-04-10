@@ -1,4 +1,4 @@
-module Blake2b.V1 exposing (hash, hash224, hash256, hash512)
+module Blake2b.V2 exposing (hash, hash224, hash256, hash512)
 
 {-| Pure Elm BLAKE2b implementation (RFC 7693) optimized for V8 performance.
 

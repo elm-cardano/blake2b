@@ -1,7 +1,7 @@
-module Blake2bV1Test exposing (suite)
+module Blake2bTest exposing (suite)
 
 import Bitwise
-import Blake2b.V1 exposing (hash, hash224, hash256, hash512)
+import Blake2b.V2 exposing (hash, hash224, hash256, hash512)
 import Bytes exposing (Bytes)
 import Bytes.Encode as Encode
 import Expect
