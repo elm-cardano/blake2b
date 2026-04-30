@@ -32,6 +32,22 @@ v1Hash256 data =
     Blake2b256.toBytes (Blake2b256.fromBytes data)
 
 
+v2Hash : { digestLength : Int, key : Bytes, data : Bytes } -> Bytes
+v2Hash r =
+    Blake2b.V2.hash { digestLength = r.digestLength, key = r.key } r.data
+        |> Blake2b.V2.stateToBytes r.digestLength
+
+
+v2Hash512 : Bytes -> Bytes
+v2Hash512 data =
+    v2Hash { digestLength = 64, key = emptyBytes, data = data }
+
+
+v2Hash256 : Bytes -> Bytes
+v2Hash256 data =
+    v2Hash { digestLength = 32, key = emptyBytes, data = data }
+
+
 emptyBytes : Bytes
 emptyBytes =
     Encode.encode (Encode.sequence [])
@@ -56,51 +72,51 @@ suite =
         [ describe "hash512"
             [ test "empty input" <|
                 \_ ->
-                    Blake2b.V2.hash512 emptyBytes
+                    v2Hash512 emptyBytes
                         |> bytesToHex
                         |> Expect.equal (v1Hash512 emptyBytes |> bytesToHex)
             , test "abc" <|
                 \_ ->
-                    Blake2b.V2.hash512 (hexToBytes "616263")
+                    v2Hash512 (hexToBytes "616263")
                         |> bytesToHex
                         |> Expect.equal (v1Hash512 (hexToBytes "616263") |> bytesToHex)
             , test "128 bytes" <|
                 \_ ->
-                    Blake2b.V2.hash512 (sequentialBytes 128)
+                    v2Hash512 (sequentialBytes 128)
                         |> bytesToHex
                         |> Expect.equal (v1Hash512 (sequentialBytes 128) |> bytesToHex)
             , test "129 bytes" <|
                 \_ ->
-                    Blake2b.V2.hash512 (sequentialBytes 129)
+                    v2Hash512 (sequentialBytes 129)
                         |> bytesToHex
                         |> Expect.equal (v1Hash512 (sequentialBytes 129) |> bytesToHex)
             , test "255 bytes" <|
                 \_ ->
-                    Blake2b.V2.hash512 (sequentialBytes 255)
+                    v2Hash512 (sequentialBytes 255)
                         |> bytesToHex
                         |> Expect.equal (v1Hash512 (sequentialBytes 255) |> bytesToHex)
             , test "1024 bytes" <|
                 \_ ->
-                    Blake2b.V2.hash512 (sequentialBytes 1024)
+                    v2Hash512 (sequentialBytes 1024)
                         |> bytesToHex
                         |> Expect.equal (v1Hash512 (sequentialBytes 1024) |> bytesToHex)
             ]
         , describe "keyed hash"
             [ test "64-byte keyed message" <|
                 \_ ->
-                    Blake2b.V2.hash { digestLength = 64, key = katKey, data = sequentialBytes 64 }
+                    v2Hash { digestLength = 64, key = katKey, data = sequentialBytes 64 }
                         |> bytesToHex
                         |> Expect.equal (v1Hash { digestLength = 64, key = katKey, data = sequentialBytes 64 } |> bytesToHex)
             , test "128-byte keyed message" <|
                 \_ ->
-                    Blake2b.V2.hash { digestLength = 64, key = katKey, data = sequentialBytes 128 }
+                    v2Hash { digestLength = 64, key = katKey, data = sequentialBytes 128 }
                         |> bytesToHex
                         |> Expect.equal (v1Hash { digestLength = 64, key = katKey, data = sequentialBytes 128 } |> bytesToHex)
             ]
         , describe "hash256"
             [ test "abc" <|
                 \_ ->
-                    Blake2b.V2.hash256 (hexToBytes "616263")
+                    v2Hash256 (hexToBytes "616263")
                         |> bytesToHex
                         |> Expect.equal (v1Hash256 (hexToBytes "616263") |> bytesToHex)
             ]
@@ -157,7 +173,7 @@ suite =
                                 }
                                 |> bytesToHex
                     in
-                    grandHash { hash = Blake2b.V2.hash }
+                    grandHash { hash = v2Hash }
                         |> Expect.equal (grandHash { hash = v1Hash })
             ]
         ]

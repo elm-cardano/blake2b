@@ -66,10 +66,6 @@ type alias MessageBlock =
     }
 
 
-{-| Four 64-bit words decoded as hi/lo Int pairs (8 fields).
-Used as an intermediate step to keep all decoder helper arities within
-Elm's F2..F9 fast path (no function exceeds 9 arguments).
--}
 type alias QuarterBlock =
     { w0Hi : Int
     , w0Lo : Int
@@ -82,112 +78,79 @@ type alias QuarterBlock =
     }
 
 
-{-| Decode 4 little-endian 64-bit words (8 × u32) into a QuarterBlock.
--}
+type alias U64 =
+    { hi : Int, lo : Int }
+
+
+decodeU64LE : Decode.Decoder U64
+decodeU64LE =
+    Decode.map2 (\lo hi -> { hi = hi, lo = lo })
+        (Decode.unsignedInt32 LE)
+        (Decode.unsignedInt32 LE)
+
+
 decodeQuarter : Decode.Decoder QuarterBlock
 decodeQuarter =
-    Decode.unsignedInt32 LE
-        |> Decode.andThen
-            (\w0Lo ->
-                Decode.unsignedInt32 LE
-                    |> Decode.andThen
-                        (\w0Hi ->
-                            Decode.unsignedInt32 LE
-                                |> Decode.andThen
-                                    (\w1Lo ->
-                                        Decode.unsignedInt32 LE
-                                            |> Decode.andThen
-                                                (\w1Hi ->
-                                                    Decode.unsignedInt32 LE
-                                                        |> Decode.andThen
-                                                            (\w2Lo ->
-                                                                Decode.unsignedInt32 LE
-                                                                    |> Decode.andThen
-                                                                        (\w2Hi ->
-                                                                            Decode.unsignedInt32 LE
-                                                                                |> Decode.andThen
-                                                                                    (\w3Lo ->
-                                                                                        Decode.unsignedInt32 LE
-                                                                                            |> Decode.map
-                                                                                                (\w3Hi ->
-                                                                                                    { w0Hi = w0Hi
-                                                                                                    , w0Lo = w0Lo
-                                                                                                    , w1Hi = w1Hi
-                                                                                                    , w1Lo = w1Lo
-                                                                                                    , w2Hi = w2Hi
-                                                                                                    , w2Lo = w2Lo
-                                                                                                    , w3Hi = w3Hi
-                                                                                                    , w3Lo = w3Lo
-                                                                                                    }
-                                                                                                )
-                                                                                    )
-                                                                        )
-                                                            )
-                                                )
-                                    )
-                        )
-            )
+    Decode.map4
+        (\w0 w1 w2 w3 ->
+            { w0Hi = w0.hi
+            , w0Lo = w0.lo
+            , w1Hi = w1.hi
+            , w1Lo = w1.lo
+            , w2Hi = w2.hi
+            , w2Lo = w2.lo
+            , w3Hi = w3.hi
+            , w3Lo = w3.lo
+            }
+        )
+        decodeU64LE
+        decodeU64LE
+        decodeU64LE
+        decodeU64LE
 
 
-{-| Decode a 128-byte block into 16 little-endian 64-bit words (as hi/lo Int pairs).
-Each 64-bit word is stored as lo 32 bits first, then hi 32 bits (little-endian byte order).
-
-Uses 4 × decodeQuarter (8 args each) to stay within Elm's 9-argument fast path.
-The previous implementation used chained helper functions with up to 28 arguments,
-causing ~55 intermediate closure allocations per block from curried overflow.
-
--}
 blockDecoder : Decode.Decoder MessageBlock
 blockDecoder =
-    decodeQuarter
-        |> Decode.andThen
-            (\q0 ->
-                decodeQuarter
-                    |> Decode.andThen
-                        (\q1 ->
-                            decodeQuarter
-                                |> Decode.andThen
-                                    (\q2 ->
-                                        decodeQuarter
-                                            |> Decode.map
-                                                (\q3 ->
-                                                    { m0Hi = q0.w0Hi
-                                                    , m0Lo = q0.w0Lo
-                                                    , m1Hi = q0.w1Hi
-                                                    , m1Lo = q0.w1Lo
-                                                    , m2Hi = q0.w2Hi
-                                                    , m2Lo = q0.w2Lo
-                                                    , m3Hi = q0.w3Hi
-                                                    , m3Lo = q0.w3Lo
-                                                    , m4Hi = q1.w0Hi
-                                                    , m4Lo = q1.w0Lo
-                                                    , m5Hi = q1.w1Hi
-                                                    , m5Lo = q1.w1Lo
-                                                    , m6Hi = q1.w2Hi
-                                                    , m6Lo = q1.w2Lo
-                                                    , m7Hi = q1.w3Hi
-                                                    , m7Lo = q1.w3Lo
-                                                    , m8Hi = q2.w0Hi
-                                                    , m8Lo = q2.w0Lo
-                                                    , m9Hi = q2.w1Hi
-                                                    , m9Lo = q2.w1Lo
-                                                    , m10Hi = q2.w2Hi
-                                                    , m10Lo = q2.w2Lo
-                                                    , m11Hi = q2.w3Hi
-                                                    , m11Lo = q2.w3Lo
-                                                    , m12Hi = q3.w0Hi
-                                                    , m12Lo = q3.w0Lo
-                                                    , m13Hi = q3.w1Hi
-                                                    , m13Lo = q3.w1Lo
-                                                    , m14Hi = q3.w2Hi
-                                                    , m14Lo = q3.w2Lo
-                                                    , m15Hi = q3.w3Hi
-                                                    , m15Lo = q3.w3Lo
-                                                    }
-                                                )
-                                    )
-                        )
-            )
+    Decode.map4
+        (\q0 q1 q2 q3 ->
+            { m0Hi = q0.w0Hi
+            , m0Lo = q0.w0Lo
+            , m1Hi = q0.w1Hi
+            , m1Lo = q0.w1Lo
+            , m2Hi = q0.w2Hi
+            , m2Lo = q0.w2Lo
+            , m3Hi = q0.w3Hi
+            , m3Lo = q0.w3Lo
+            , m4Hi = q1.w0Hi
+            , m4Lo = q1.w0Lo
+            , m5Hi = q1.w1Hi
+            , m5Lo = q1.w1Lo
+            , m6Hi = q1.w2Hi
+            , m6Lo = q1.w2Lo
+            , m7Hi = q1.w3Hi
+            , m7Lo = q1.w3Lo
+            , m8Hi = q2.w0Hi
+            , m8Lo = q2.w0Lo
+            , m9Hi = q2.w1Hi
+            , m9Lo = q2.w1Lo
+            , m10Hi = q2.w2Hi
+            , m10Lo = q2.w2Lo
+            , m11Hi = q2.w3Hi
+            , m11Lo = q2.w3Lo
+            , m12Hi = q3.w0Hi
+            , m12Lo = q3.w0Lo
+            , m13Hi = q3.w1Hi
+            , m13Lo = q3.w1Lo
+            , m14Hi = q3.w2Hi
+            , m14Lo = q3.w2Lo
+            , m15Hi = q3.w3Hi
+            , m15Lo = q3.w3Lo
+            }
+        )
+        decodeQuarter
+        decodeQuarter
+        decodeQuarter
+        decodeQuarter
 
 
 {-| Encode the hash state (8 x 64-bit words as hi/lo pairs) into the first

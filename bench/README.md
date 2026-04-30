@@ -43,6 +43,27 @@ elm-test
 
 ## History of performance optimizations
 
+Changes in V7 (from V6):
+
+- Replaces andThen chains in blockDecoder/decodeQuarter with map2/map4.
+  decodeU64LE uses map2 to decode a lo/hi pair into a U64 record;
+  decodeQuarter uses map4 over 4 decodeU64LE; blockDecoder uses map4
+  over 4 decodeQuarter. Eliminates 31 intermediate closures per block
+  decode (7 andThen × 4 quarters + 3 andThen in blockDecoder), replaced
+  by 16 U64 records + 4 QuarterBlock records. ~23% faster.
+
+Failed experiments (5 bench variants, all slower than fully-inlined version):
+
+- Full G as F5 with ABCD record in/out: +130% (8 calls/round, 96 ABCD records/compress)
+- Half-G pipeline as F3 with ABCD record: +185% (16 calls/round)
+- Full G as F2 with ABCD + XY records: +147% (extra XY allocation per call)
+- Half-G F3 + intermediate WorkingVector: +201% (rebuilding full WV between phases)
+- Tiny U64 primitives as F4: +299% (80 calls/round, death by allocation)
+
+Conclusion: V8 does not perform scalar replacement on these records, so
+every extraction from the fully-inlined round function adds real heap
+allocation overhead. The inlined approach remains optimal for the hot loop.
+
 Changes in V6 (from V5):
 
 - Pre-pads input to a 128-byte boundary before entering the decode loop,
