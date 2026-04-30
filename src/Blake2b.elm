@@ -1,43 +1,117 @@
-module Blake2b exposing (hash, hash512, hash256, hash224)
+module Blake2b exposing
+    ( Digest
+    , fromString, fromBytes, fromByteValues
+    , toHex, toBase64
+    , toBytes, toByteValues
+    )
 
-{-| Pure Elm BLAKE2b implementation (RFC 7693).
+{-| [BLAKE2b] is a [cryptographic hash function] (RFC 7693) that supports
+keyed hashing and variable-length output (1 to 64 bytes).
 
-@docs hash, hash512, hash256, hash224
+For fixed-length unkeyed hashes, prefer the dedicated modules
+[`Blake2b224`](Blake2b224), [`Blake2b256`](Blake2b256), or
+[`Blake2b512`](Blake2b512).
+
+[BLAKE2b]: https://datatracker.ietf.org/doc/html/rfc7693
+[cryptographic hash function]: https://en.wikipedia.org/wiki/Cryptographic_hash_function
+
+@docs Digest
+
+
+# Creating digests
+
+@docs fromString, fromBytes, fromByteValues
+
+
+# Formatting digests
+
+@docs toHex, toBase64
+
+
+# To binary data
+
+@docs toBytes, toByteValues
 
 -}
 
+import Base64
 import Blake2b.V1
 import Bytes exposing (Bytes)
+import Bytes.Encode as Encode
+import Hex
 
 
-{-| Compute a BLAKE2b hash with the given digest length, key, and data.
+{-| An abstract BLAKE2b digest. Its length matches the `digestLength` passed
+to the constructor.
+-}
+type Digest
+    = Digest Bytes
 
-    - digestLength: 1 to 64 (number of output bytes)
-    - key: 0 to 64 bytes (use empty Bytes for unkeyed hashing)
-    - data: the message to hash
+
+{-| Create a digest from a `String`.
+
+`digestLength` is the output length in bytes (1 to 64). Use empty `Bytes`
+as `key` for unkeyed hashing, or a 1-to-64 byte key for a keyed hash (MAC).
+
+    import Blake2b
+    import Bytes.Encode as Encode
+
+    Blake2b.fromString
+        { digestLength = 32, key = Encode.encode (Encode.sequence []) }
+        "hello"
+        |> Blake2b.toHex
+    --> "324dcf027dd4a30a932c441f365a25e86b173defa4b8e58948253471b81b72cf"
 
 -}
-hash : { digestLength : Int, key : Bytes, data : Bytes } -> Bytes
-hash =
-    Blake2b.V1.hash
+fromString : { digestLength : Int, key : Bytes } -> String -> Digest
+fromString config str =
+    fromBytes config (Encode.encode (Encode.string str))
 
 
-{-| Compute a 512-bit (64-byte) BLAKE2b hash.
+{-| Create a digest from [`Bytes`](https://package.elm-lang.org/packages/elm/bytes/latest/).
 -}
-hash512 : Bytes -> Bytes
-hash512 =
-    Blake2b.V1.hash512
+fromBytes : { digestLength : Int, key : Bytes } -> Bytes -> Digest
+fromBytes config bytes =
+    Digest
+        (Blake2b.V1.hash
+            { digestLength = config.digestLength
+            , key = config.key
+            , data = bytes
+            }
+        )
 
 
-{-| Compute a 256-bit (32-byte) BLAKE2b hash.
+{-| Create a digest from a list of byte values (0-255).
 -}
-hash256 : Bytes -> Bytes
-hash256 =
-    Blake2b.V1.hash256
+fromByteValues : { digestLength : Int, key : Bytes } -> List Int -> Digest
+fromByteValues config values =
+    fromBytes config (Encode.encode (Encode.sequence (List.map Encode.unsignedInt8 values)))
 
 
-{-| Compute a 224-bit (28-byte) BLAKE2b hash.
+{-| Turn a digest into a hex string.
 -}
-hash224 : Bytes -> Bytes
-hash224 =
-    Blake2b.V1.hash224
+toHex : Digest -> String
+toHex (Digest b) =
+    Hex.fromBytes b
+
+
+{-| Turn a digest into a base64 encoded string.
+-}
+toBase64 : Digest -> String
+toBase64 (Digest b) =
+    Base64.fromBytes b
+
+
+{-| Turn a digest into `Bytes`. Width matches the `digestLength` used at
+construction time.
+-}
+toBytes : Digest -> Bytes
+toBytes (Digest b) =
+    b
+
+
+{-| Turn a digest into a list of byte values (0-255).
+-}
+toByteValues : Digest -> List Int
+toByteValues (Digest b) =
+    Blake2b.V1.bytesToList b

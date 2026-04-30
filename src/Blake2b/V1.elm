@@ -1,4 +1,4 @@
-module Blake2b.V1 exposing (hash, hash224, hash256, hash512)
+module Blake2b.V1 exposing (bytesToList, hash, hash224, hash256, hash512)
 
 {-| Pure Elm BLAKE2b implementation (RFC 7693) optimized for V8 performance.
 
@@ -2317,3 +2317,22 @@ hash256 data =
 hash224 : Bytes -> Bytes
 hash224 data =
     hash { digestLength = 28, key = emptyBytes, data = data }
+
+
+{-| Decode a `Bytes` value into a list of byte values (0-255).
+-}
+bytesToList : Bytes -> List Int
+bytesToList bytes =
+    let
+        step : ( Int, List Int ) -> Decode.Decoder (Decode.Step ( Int, List Int ) (List Int))
+        step ( remaining, acc ) =
+            if remaining <= 0 then
+                Decode.succeed (Decode.Done (List.reverse acc))
+
+            else
+                Decode.map
+                    (\v -> Decode.Loop ( remaining - 1, v :: acc ))
+                    Decode.unsignedInt8
+    in
+    Decode.decode (Decode.loop ( Bytes.width bytes, [] ) step) bytes
+        |> Maybe.withDefault []

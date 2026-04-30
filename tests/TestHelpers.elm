@@ -1,7 +1,6 @@
-module TestHelpers exposing (bytesToHex, hexToBytes)
+module TestHelpers exposing (hexToBytes)
 
 import Bytes exposing (Bytes)
-import Bytes.Decode as Decode
 import Bytes.Encode as Encode
 
 
@@ -49,56 +48,3 @@ hexCharToInt c =
 
     else
         0
-
-
-{-| Convert Bytes to a lowercase hex string.
--}
-bytesToHex : Bytes -> String
-bytesToHex bytes =
-    case Decode.decode (bytesToHexDecoder (Bytes.width bytes)) bytes of
-        Just hex ->
-            hex
-
-        Nothing ->
-            ""
-
-
-bytesToHexDecoder : Int -> Decode.Decoder String
-bytesToHexDecoder len =
-    Decode.loop ( len, "" ) bytesToHexStep
-
-
-bytesToHexStep : ( Int, String ) -> Decode.Decoder (Decode.Step ( Int, String ) String)
-bytesToHexStep ( remaining, acc ) =
-    if remaining <= 0 then
-        Decode.succeed (Decode.Done acc)
-
-    else
-        Decode.unsignedInt8
-            |> Decode.map
-                (\byte ->
-                    Decode.Loop ( remaining - 1, acc ++ byteToHex byte )
-                )
-
-
-byteToHex : Int -> String
-byteToHex byte =
-    let
-        hi : Char
-        hi =
-            nibbleToChar (byte // 16)
-
-        lo : Char
-        lo =
-            nibbleToChar (modBy 16 byte)
-    in
-    String.fromChar hi ++ String.fromChar lo
-
-
-nibbleToChar : Int -> Char
-nibbleToChar n =
-    if n < 10 then
-        Char.fromCode (0x30 + n)
-
-    else
-        Char.fromCode (0x61 + n - 10)
