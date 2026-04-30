@@ -34,18 +34,17 @@ For fixed-length unkeyed hashes, prefer the dedicated modules
 
 -}
 
-import Base64
+import Blake2b.DecodeV1 exposing (HashState)
 import Blake2b.V1
 import Bytes exposing (Bytes)
 import Bytes.Encode as Encode
-import Hex
 
 
 {-| An abstract BLAKE2b digest. Its length matches the `digestLength` passed
 to the constructor.
 -}
 type Digest
-    = Digest Bytes
+    = Digest Int HashState
 
 
 {-| Create a digest from a `String`.
@@ -72,13 +71,7 @@ fromString config str =
 -}
 fromBytes : { digestLength : Int, key : Bytes } -> Bytes -> Digest
 fromBytes config bytes =
-    Digest
-        (Blake2b.V1.hash
-            { digestLength = config.digestLength
-            , key = config.key
-            , data = bytes
-            }
-        )
+    Digest config.digestLength (Blake2b.V1.hash config bytes)
 
 
 {-| Create a digest from a list of byte values (0-255).
@@ -91,27 +84,27 @@ fromByteValues config values =
 {-| Turn a digest into a hex string.
 -}
 toHex : Digest -> String
-toHex (Digest b) =
-    Hex.fromBytes b
+toHex (Digest len s) =
+    Blake2b.V1.stateToHex len s
 
 
 {-| Turn a digest into a base64 encoded string.
 -}
 toBase64 : Digest -> String
-toBase64 (Digest b) =
-    Base64.fromBytes b
+toBase64 (Digest len s) =
+    Blake2b.V1.stateToBase64 len s
 
 
 {-| Turn a digest into `Bytes`. Width matches the `digestLength` used at
 construction time.
 -}
 toBytes : Digest -> Bytes
-toBytes (Digest b) =
-    b
+toBytes (Digest len s) =
+    Blake2b.V1.stateToBytes len s
 
 
 {-| Turn a digest into a list of byte values (0-255).
 -}
 toByteValues : Digest -> List Int
-toByteValues (Digest b) =
-    Blake2b.V1.bytesToList b
+toByteValues (Digest len s) =
+    Blake2b.V1.stateToByteValues len s

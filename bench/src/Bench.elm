@@ -26,8 +26,8 @@ elm-bench -f Bench.v1_4096 -f Bench.v2_4096 "()"
 
 -}
 
-import Blake2b.V1
 import Blake2b.V2
+import Blake2b512
 import Bytes exposing (Bytes)
 import Bytes.Encode as Encode
 
@@ -65,39 +65,44 @@ bytes4096 =
     makeBytes 4096
 
 
+v1Hash512 : Bytes -> Bytes
+v1Hash512 data =
+    Blake2b512.toBytes (Blake2b512.fromBytes data)
+
+
 {-| V1 BLAKE2b-512 on 64 bytes.
 -}
 v1_64 : () -> Bytes
 v1_64 () =
-    Blake2b.V1.hash512 bytes64
+    v1Hash512 bytes64
 
 
 {-| V1 BLAKE2b-512 on 129 bytes.
 -}
 v1_129 : () -> Bytes
 v1_129 () =
-    Blake2b.V1.hash512 bytes129
+    v1Hash512 bytes129
 
 
 {-| V1 BLAKE2b-512 on 256 bytes.
 -}
 v1_256 : () -> Bytes
 v1_256 () =
-    Blake2b.V1.hash512 bytes256
+    v1Hash512 bytes256
 
 
 {-| V1 BLAKE2b-512 on 1024 bytes.
 -}
 v1_1024 : () -> Bytes
 v1_1024 () =
-    Blake2b.V1.hash512 bytes1024
+    v1Hash512 bytes1024
 
 
 {-| V1 BLAKE2b-512 on 4096 bytes.
 -}
 v1_4096 : () -> Bytes
 v1_4096 () =
-    Blake2b.V1.hash512 bytes4096
+    v1Hash512 bytes4096
 
 
 {-| V2 BLAKE2b-512 on 64 bytes.

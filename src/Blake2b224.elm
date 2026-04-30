@@ -30,17 +30,16 @@ module Blake2b224 exposing
 
 -}
 
-import Base64
+import Blake2b.DecodeV1 exposing (HashState)
 import Blake2b.V1
 import Bytes exposing (Bytes)
 import Bytes.Encode as Encode
-import Hex
 
 
 {-| An abstract BLAKE2b-224 digest (28 bytes).
 -}
 type Digest
-    = Digest Bytes
+    = Digest HashState
 
 
 {-| Create a digest from a `String`.
@@ -61,7 +60,12 @@ fromString str =
 -}
 fromBytes : Bytes -> Digest
 fromBytes bytes =
-    Digest (Blake2b.V1.hash224 bytes)
+    Digest (Blake2b.V1.hash { digestLength = 28, key = emptyBytes } bytes)
+
+
+emptyBytes : Bytes
+emptyBytes =
+    Encode.encode (Encode.sequence [])
 
 
 {-| Create a digest from a list of byte values (0-255).
@@ -74,26 +78,26 @@ fromByteValues values =
 {-| Turn a digest into a hex string.
 -}
 toHex : Digest -> String
-toHex (Digest b) =
-    Hex.fromBytes b
+toHex (Digest s) =
+    Blake2b.V1.stateToHex 28 s
 
 
 {-| Turn a digest into a base64 encoded string.
 -}
 toBase64 : Digest -> String
-toBase64 (Digest b) =
-    Base64.fromBytes b
+toBase64 (Digest s) =
+    Blake2b.V1.stateToBase64 28 s
 
 
 {-| Turn a digest into `Bytes`. The width is 28 bytes (224 bits).
 -}
 toBytes : Digest -> Bytes
-toBytes (Digest b) =
-    b
+toBytes (Digest s) =
+    Blake2b.V1.stateToBytes 28 s
 
 
 {-| Turn a digest into a list of byte values (0-255).
 -}
 toByteValues : Digest -> List Int
-toByteValues (Digest b) =
-    Blake2b.V1.bytesToList b
+toByteValues (Digest s) =
+    Blake2b.V1.stateToByteValues 28 s

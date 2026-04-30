@@ -1,4 +1,10 @@
-module Blake2b.V1 exposing (bytesToList, hash, hash224, hash256, hash512)
+module Blake2b.V1 exposing
+    ( hash
+    , stateToBase64
+    , stateToByteValues
+    , stateToBytes
+    , stateToHex
+    )
 
 {-| Pure Elm BLAKE2b implementation (RFC 7693) optimized for V8 performance.
 
@@ -44,12 +50,14 @@ Base (V1):
 
 -}
 
+import Base64
 import Bitwise
 import Blake2b.Constants exposing (iv0Hi, iv0Lo, iv1Hi, iv1Lo, iv2Hi, iv2Lo, iv3Hi, iv3Lo, iv4Hi, iv4Lo, iv5Hi, iv5Lo, iv6Hi, iv6Lo, iv7Hi, iv7Lo)
-import Blake2b.DecodeV1 exposing (MessageBlock, blockDecoder, encodeDigest)
+import Blake2b.DecodeV1 exposing (HashState, MessageBlock, blockDecoder, encodeDigest)
 import Bytes exposing (Bytes, Endianness(..))
 import Bytes.Decode as Decode
 import Bytes.Encode as Encode
+import Hex
 
 
 
@@ -102,26 +110,6 @@ type alias WorkingVector =
     , v14Lo : Int
     , v15Hi : Int
     , v15Lo : Int
-    }
-
-
-type alias HashState =
-    { h0Hi : Int
-    , h0Lo : Int
-    , h1Hi : Int
-    , h1Lo : Int
-    , h2Hi : Int
-    , h2Lo : Int
-    , h3Hi : Int
-    , h3Lo : Int
-    , h4Hi : Int
-    , h4Lo : Int
-    , h5Hi : Int
-    , h5Lo : Int
-    , h6Hi : Int
-    , h6Lo : Int
-    , h7Hi : Int
-    , h7Lo : Int
     }
 
 
@@ -2134,11 +2122,6 @@ blockLoop acc =
 -- HASH FUNCTIONS
 
 
-emptyBytes : Bytes
-emptyBytes =
-    Encode.encode (Encode.sequence [])
-
-
 {-| Pre-decoded zero block (128 zero bytes), hoisted to module level.
 Used for empty unkeyed input where we compress a single zero block.
 -}
@@ -2179,15 +2162,20 @@ zeroMessageBlock =
     }
 
 
-{-| Compute a BLAKE2b hash with the given digest length, key, and data.
+{-| Compute a BLAKE2b hash state for the given configuration and message.
 
-    - digestLength: 1 to 64 (number of output bytes)
+    - digestLength: 1 to 64 (affects the parameter block mixed into the initial state)
     - key: 0 to 64 bytes (use empty Bytes for unkeyed hashing)
-    - data: the message to hash
+    - data: the message to hash (passed as the second argument)
+
+The returned `HashState` can be encoded with [`stateToBytes`](#stateToBytes),
+[`stateToByteValues`](#stateToByteValues), [`stateToHex`](#stateToHex), or
+[`stateToBase64`](#stateToBase64), passing the same `digestLength` that was
+used here.
 
 -}
-hash : { digestLength : Int, key : Bytes, data : Bytes } -> Bytes
-hash config =
+hash : { digestLength : Int, key : Bytes } -> Bytes -> HashState
+hash config data =
     let
         keyLen : Int
         keyLen =
@@ -2195,7 +2183,7 @@ hash config =
 
         dataLen : Int
         dataLen =
-            Bytes.width config.data
+            Bytes.width data
 
         totalLen : Int
         totalLen =
@@ -2229,110 +2217,123 @@ hash config =
             , h7Hi = iv7Hi
             , h7Lo = iv7Lo
             }
+    in
+    if totalLen == 0 then
+        -- Empty unkeyed: compress one zero block with counter=0, final
+        compress initState 0 0 0 0 True zeroMessageBlock
 
-        finalState : HashState
-        finalState =
-            if totalLen == 0 then
-                -- Empty unkeyed: compress one zero block with counter=0, final
-                compress initState 0 0 0 0 True zeroMessageBlock
-
-            else
+    else
+        let
+            -- Pre-pad input to a multiple of 128 bytes so the loop always
+            -- reads full blocks. Avoids the pad+re-decode round-trip for
+            -- partial last blocks.
+            paddedData : Bytes
+            paddedData =
                 let
-                    -- Pre-pad input to a multiple of 128 bytes so the loop always
-                    -- reads full blocks. Avoids the pad+re-decode round-trip for
-                    -- partial last blocks.
-                    paddedData : Bytes
-                    paddedData =
-                        let
-                            -- Build full input data (key block prepended if keyed)
-                            fullData : Bytes
-                            fullData =
-                                if keyLen > 0 then
-                                    Encode.encode
-                                        (Encode.sequence
-                                            [ Encode.bytes config.key
-                                            , Encode.sequence (List.repeat (128 - keyLen) (Encode.unsignedInt8 0))
-                                            , Encode.bytes config.data
-                                            ]
-                                        )
-
-                                else
-                                    config.data
-
-                            remainder : Int
-                            remainder =
-                                remainderBy 128 totalLen
-                        in
-                        if remainder == 0 then
-                            fullData
-
-                        else
-                            let
-                                padNeeded : Int
-                                padNeeded =
-                                    128 - remainder
-
-                                zeroU32s : Int
-                                zeroU32s =
-                                    padNeeded // 4
-
-                                tailU8s : Int
-                                tailU8s =
-                                    remainderBy 4 padNeeded
-                            in
+                    -- Build full input data (key block prepended if keyed)
+                    fullData : Bytes
+                    fullData =
+                        if keyLen > 0 then
                             Encode.encode
                                 (Encode.sequence
-                                    [ Encode.bytes fullData
-                                    , Encode.sequence (List.repeat zeroU32s (Encode.unsignedInt32 LE 0))
-                                    , Encode.sequence (List.repeat tailU8s (Encode.unsignedInt8 0))
+                                    [ Encode.bytes config.key
+                                    , Encode.sequence (List.repeat (128 - keyLen) (Encode.unsignedInt8 0))
+                                    , Encode.bytes data
                                     ]
                                 )
+
+                        else
+                            data
+
+                    remainder : Int
+                    remainder =
+                        remainderBy 128 totalLen
                 in
-                case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) paddedData of
-                    Just hs ->
-                        hs
+                if remainder == 0 then
+                    fullData
 
-                    Nothing ->
-                        initState
-    in
-    encodeDigest config.digestLength finalState
+                else
+                    let
+                        padNeeded : Int
+                        padNeeded =
+                            128 - remainder
+
+                        zeroU32s : Int
+                        zeroU32s =
+                            padNeeded // 4
+
+                        tailU8s : Int
+                        tailU8s =
+                            remainderBy 4 padNeeded
+                    in
+                    Encode.encode
+                        (Encode.sequence
+                            [ Encode.bytes fullData
+                            , Encode.sequence (List.repeat zeroU32s (Encode.unsignedInt32 LE 0))
+                            , Encode.sequence (List.repeat tailU8s (Encode.unsignedInt8 0))
+                            ]
+                        )
+        in
+        case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) paddedData of
+            Just hs ->
+                hs
+
+            Nothing ->
+                initState
 
 
-{-| Compute a 512-bit (64-byte) BLAKE2b hash of the given data.
+{-| Encode a hash state as `Bytes`, truncated to `digestLength` bytes.
 -}
-hash512 : Bytes -> Bytes
-hash512 data =
-    hash { digestLength = 64, key = emptyBytes, data = data }
+stateToBytes : Int -> HashState -> Bytes
+stateToBytes digestLength state =
+    encodeDigest digestLength state
 
 
-{-| Compute a 256-bit (32-byte) BLAKE2b hash of the given data.
+{-| Encode a hash state as a hex string, truncated to `digestLength` bytes.
 -}
-hash256 : Bytes -> Bytes
-hash256 data =
-    hash { digestLength = 32, key = emptyBytes, data = data }
+stateToHex : Int -> HashState -> String
+stateToHex digestLength state =
+    Hex.fromBytes (encodeDigest digestLength state)
 
 
-{-| Compute a 224-bit (28-byte) BLAKE2b hash of the given data.
+{-| Encode a hash state as a base64 string, truncated to `digestLength` bytes.
 -}
-hash224 : Bytes -> Bytes
-hash224 data =
-    hash { digestLength = 28, key = emptyBytes, data = data }
+stateToBase64 : Int -> HashState -> String
+stateToBase64 digestLength state =
+    Base64.fromBytes (encodeDigest digestLength state)
 
 
-{-| Decode a `Bytes` value into a list of byte values (0-255).
+{-| Encode a hash state as a list of byte values (0-255), truncated to
+`digestLength` bytes. Extracts bytes directly from the 16 hi/lo Int fields
+without going through a `Bytes` round trip.
 -}
-bytesToList : Bytes -> List Int
-bytesToList bytes =
-    let
-        step : ( Int, List Int ) -> Decode.Decoder (Decode.Step ( Int, List Int ) (List Int))
-        step ( remaining, acc ) =
-            if remaining <= 0 then
-                Decode.succeed (Decode.Done (List.reverse acc))
+stateToByteValues : Int -> HashState -> List Int
+stateToByteValues digestLength s =
+    List.take digestLength
+        (List.concat
+            [ wordToBytes s.h0Lo s.h0Hi
+            , wordToBytes s.h1Lo s.h1Hi
+            , wordToBytes s.h2Lo s.h2Hi
+            , wordToBytes s.h3Lo s.h3Hi
+            , wordToBytes s.h4Lo s.h4Hi
+            , wordToBytes s.h5Lo s.h5Hi
+            , wordToBytes s.h6Lo s.h6Hi
+            , wordToBytes s.h7Lo s.h7Hi
+            ]
+        )
 
-            else
-                Decode.map
-                    (\v -> Decode.Loop ( remaining - 1, v :: acc ))
-                    Decode.unsignedInt8
-    in
-    Decode.decode (Decode.loop ( Bytes.width bytes, [] ) step) bytes
-        |> Maybe.withDefault []
+
+{-| Convert one 64-bit word (split into 32-bit hi/lo halves) into 8 bytes
+in little-endian order: lo byte 0..3 then hi byte 0..3.
+-}
+wordToBytes : Int -> Int -> List Int
+wordToBytes lo hi =
+    [ Bitwise.and 0xFF lo
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 8 lo)
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 16 lo)
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 24 lo)
+    , Bitwise.and 0xFF hi
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 8 hi)
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 16 hi)
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 24 hi)
+    ]

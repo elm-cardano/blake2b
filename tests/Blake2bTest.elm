@@ -6,6 +6,7 @@ import Blake2b224
 import Blake2b256
 import Blake2b512
 import Bytes exposing (Bytes)
+import Bytes.Decode as Decode
 import Bytes.Encode as Encode
 import Expect
 import Test exposing (Test, describe, test)
@@ -174,16 +175,38 @@ convenienceFunctions =
                     |> Blake2b256.toHex
                     |> Expect.equal
                         (Blake2b256.fromBytes (hexToBytes "616263") |> Blake2b256.toHex)
-        , test "toByteValues round-trips through fromByteValues" <|
+        , test "toByteValues matches toBytes byte-for-byte" <|
             \_ ->
                 let
                     digest : Blake2b256.Digest
                     digest =
                         Blake2b256.fromBytes (hexToBytes "616263")
                 in
-                Blake2b256.toByteValues digest
-                    |> List.length
-                    |> Expect.equal 32
+                Expect.equal
+                    (Blake2b256.toByteValues digest)
+                    (bytesToList (Blake2b256.toBytes digest))
+        , test "Blake2b512 toByteValues matches toBytes byte-for-byte" <|
+            \_ ->
+                let
+                    digest : Blake2b512.Digest
+                    digest =
+                        Blake2b512.fromBytes (hexToBytes "616263")
+                in
+                Expect.equal
+                    (Blake2b512.toByteValues digest)
+                    (bytesToList (Blake2b512.toBytes digest))
+        , test "Blake2b (variable length) toByteValues matches toBytes" <|
+            \_ ->
+                let
+                    digest : Blake2b.Digest
+                    digest =
+                        Blake2b.fromBytes
+                            { digestLength = 17, key = emptyBytes }
+                            (hexToBytes "616263")
+                in
+                Expect.equal
+                    (Blake2b.toByteValues digest)
+                    (bytesToList (Blake2b.toBytes digest))
         , test "toBase64 produces a non-empty string" <|
             \_ ->
                 Blake2b256.fromBytes emptyBytes
@@ -191,6 +214,23 @@ convenienceFunctions =
                     |> String.isEmpty
                     |> Expect.equal False
         ]
+
+
+bytesToList : Bytes -> List Int
+bytesToList bytes =
+    let
+        step : ( Int, List Int ) -> Decode.Decoder (Decode.Step ( Int, List Int ) (List Int))
+        step ( remaining, acc ) =
+            if remaining <= 0 then
+                Decode.succeed (Decode.Done (List.reverse acc))
+
+            else
+                Decode.map
+                    (\v -> Decode.Loop ( remaining - 1, v :: acc ))
+                    Decode.unsignedInt8
+    in
+    Decode.decode (Decode.loop ( Bytes.width bytes, [] ) step) bytes
+        |> Maybe.withDefault []
 
 
 
