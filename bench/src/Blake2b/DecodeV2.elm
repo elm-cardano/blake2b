@@ -1,5 +1,6 @@
 module Blake2b.DecodeV2 exposing
-    ( MessageBlock
+    ( HashState
+    , MessageBlock
     , blockDecoder
     , encodeDigest
     )
@@ -7,6 +8,26 @@ module Blake2b.DecodeV2 exposing
 import Bytes exposing (Bytes, Endianness(..))
 import Bytes.Decode as Decode
 import Bytes.Encode as Encode
+
+
+type alias HashState =
+    { h0Hi : Int
+    , h0Lo : Int
+    , h1Hi : Int
+    , h1Lo : Int
+    , h2Hi : Int
+    , h2Lo : Int
+    , h3Hi : Int
+    , h3Lo : Int
+    , h4Hi : Int
+    , h4Lo : Int
+    , h5Hi : Int
+    , h5Lo : Int
+    , h6Hi : Int
+    , h6Lo : Int
+    , h7Hi : Int
+    , h7Lo : Int
+    }
 
 
 type alias MessageBlock =
@@ -173,7 +194,7 @@ blockDecoder =
 digestLength bytes. Each word is encoded as lo then hi in little-endian order,
 producing 64 bytes total, then the first digestLength bytes are extracted.
 -}
-encodeDigest : Int -> { h0Hi : Int, h0Lo : Int, h1Hi : Int, h1Lo : Int, h2Hi : Int, h2Lo : Int, h3Hi : Int, h3Lo : Int, h4Hi : Int, h4Lo : Int, h5Hi : Int, h5Lo : Int, h6Hi : Int, h6Lo : Int, h7Hi : Int, h7Lo : Int } -> Bytes
+encodeDigest : Int -> HashState -> Bytes
 encodeDigest digestLength h =
     let
         full : Bytes

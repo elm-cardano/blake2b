@@ -65,9 +65,20 @@ bytes4096 =
     makeBytes 4096
 
 
+emptyKey : Bytes
+emptyKey =
+    Encode.encode (Encode.sequence [])
+
+
 v1Hash512 : Bytes -> Bytes
 v1Hash512 data =
     Blake2b512.toBytes (Blake2b512.fromBytes data)
+
+
+v2Hash512 : Bytes -> Bytes
+v2Hash512 data =
+    Blake2b.V2.hash { digestLength = 64, key = emptyKey } data
+        |> Blake2b.V2.stateToBytes 64
 
 
 {-| V1 BLAKE2b-512 on 64 bytes.
@@ -109,32 +120,32 @@ v1_4096 () =
 -}
 v2_64 : () -> Bytes
 v2_64 () =
-    Blake2b.V2.hash512 bytes64
+    v2Hash512 bytes64
 
 
 {-| V2 BLAKE2b-512 on 129 bytes.
 -}
 v2_129 : () -> Bytes
 v2_129 () =
-    Blake2b.V2.hash512 bytes129
+    v2Hash512 bytes129
 
 
 {-| V2 BLAKE2b-512 on 256 bytes.
 -}
 v2_256 : () -> Bytes
 v2_256 () =
-    Blake2b.V2.hash512 bytes256
+    v2Hash512 bytes256
 
 
 {-| V2 BLAKE2b-512 on 1024 bytes.
 -}
 v2_1024 : () -> Bytes
 v2_1024 () =
-    Blake2b.V2.hash512 bytes1024
+    v2Hash512 bytes1024
 
 
 {-| V2 BLAKE2b-512 on 4096 bytes.
 -}
 v2_4096 : () -> Bytes
 v2_4096 () =
-    Blake2b.V2.hash512 bytes4096
+    v2Hash512 bytes4096

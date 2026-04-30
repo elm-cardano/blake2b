@@ -1,4 +1,10 @@
-module Blake2b.V2 exposing (hash, hash224, hash256, hash512)
+module Blake2b.V2 exposing
+    ( hash
+    , stateToBase64
+    , stateToByteValues
+    , stateToBytes
+    , stateToHex
+    )
 
 {-| Pure Elm BLAKE2b implementation (RFC 7693) optimized for V8 performance.
 
@@ -44,12 +50,14 @@ Base (V1):
 
 -}
 
+import Base64
 import Bitwise
 import Blake2b.Constants exposing (iv0Hi, iv0Lo, iv1Hi, iv1Lo, iv2Hi, iv2Lo, iv3Hi, iv3Lo, iv4Hi, iv4Lo, iv5Hi, iv5Lo, iv6Hi, iv6Lo, iv7Hi, iv7Lo)
-import Blake2b.DecodeV2 exposing (MessageBlock, blockDecoder, encodeDigest)
+import Blake2b.DecodeV2 exposing (HashState, MessageBlock, blockDecoder, encodeDigest)
 import Bytes exposing (Bytes, Endianness(..))
 import Bytes.Decode as Decode
 import Bytes.Encode as Encode
+import Hex
 
 
 
@@ -102,26 +110,6 @@ type alias WorkingVector =
     , v14Lo : Int
     , v15Hi : Int
     , v15Lo : Int
-    }
-
-
-type alias HashState =
-    { h0Hi : Int
-    , h0Lo : Int
-    , h1Hi : Int
-    , h1Lo : Int
-    , h2Hi : Int
-    , h2Lo : Int
-    , h3Hi : Int
-    , h3Lo : Int
-    , h4Hi : Int
-    , h4Lo : Int
-    , h5Hi : Int
-    , h5Lo : Int
-    , h6Hi : Int
-    , h6Lo : Int
-    , h7Hi : Int
-    , h7Lo : Int
     }
 
 
@@ -1567,39 +1555,7 @@ round mb v =
         g7_b2Lo =
             Bitwise.or (Bitwise.shiftLeftBy 1 g7_b2xLo) (Bitwise.shiftRightZfBy 31 g7_b2xHi)
     in
-    { v0Hi = g4_a2Hi
-    , v0Lo = g4_a2Lo
-    , v1Hi = g5_a2Hi
-    , v1Lo = g5_a2Lo
-    , v2Hi = g6_a2Hi
-    , v2Lo = g6_a2Lo
-    , v3Hi = g7_a2Hi
-    , v3Lo = g7_a2Lo
-    , v4Hi = g7_b2Hi
-    , v4Lo = g7_b2Lo
-    , v5Hi = g4_b2Hi
-    , v5Lo = g4_b2Lo
-    , v6Hi = g5_b2Hi
-    , v6Lo = g5_b2Lo
-    , v7Hi = g6_b2Hi
-    , v7Lo = g6_b2Lo
-    , v8Hi = g6_c2Hi
-    , v8Lo = g6_c2Lo
-    , v9Hi = g7_c2Hi
-    , v9Lo = g7_c2Lo
-    , v10Hi = g4_c2Hi
-    , v10Lo = g4_c2Lo
-    , v11Hi = g5_c2Hi
-    , v11Lo = g5_c2Lo
-    , v12Hi = g5_d2Hi
-    , v12Lo = g5_d2Lo
-    , v13Hi = g6_d2Hi
-    , v13Lo = g6_d2Lo
-    , v14Hi = g7_d2Hi
-    , v14Lo = g7_d2Lo
-    , v15Hi = g4_d2Hi
-    , v15Lo = g4_d2Lo
-    }
+    { v0Hi = g4_a2Hi, v0Lo = g4_a2Lo, v1Hi = g5_a2Hi, v1Lo = g5_a2Lo, v2Hi = g6_a2Hi, v2Lo = g6_a2Lo, v3Hi = g7_a2Hi, v3Lo = g7_a2Lo, v4Hi = g7_b2Hi, v4Lo = g7_b2Lo, v5Hi = g4_b2Hi, v5Lo = g4_b2Lo, v6Hi = g5_b2Hi, v6Lo = g5_b2Lo, v7Hi = g6_b2Hi, v7Lo = g6_b2Lo, v8Hi = g6_c2Hi, v8Lo = g6_c2Lo, v9Hi = g7_c2Hi, v9Lo = g7_c2Lo, v10Hi = g4_c2Hi, v10Lo = g4_c2Lo, v11Hi = g5_c2Hi, v11Lo = g5_c2Lo, v12Hi = g5_d2Hi, v12Lo = g5_d2Lo, v13Hi = g6_d2Hi, v13Lo = g6_d2Lo, v14Hi = g7_d2Hi, v14Lo = g7_d2Lo, v15Hi = g4_d2Hi, v15Lo = g4_d2Lo }
 
 
 
@@ -1665,351 +1621,63 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
         vR1 : WorkingVector
         vR1 =
             round
-                { m0Hi = mb.m14Hi
-                , m0Lo = mb.m14Lo
-                , m1Hi = mb.m10Hi
-                , m1Lo = mb.m10Lo
-                , m2Hi = mb.m4Hi
-                , m2Lo = mb.m4Lo
-                , m3Hi = mb.m8Hi
-                , m3Lo = mb.m8Lo
-                , m4Hi = mb.m9Hi
-                , m4Lo = mb.m9Lo
-                , m5Hi = mb.m15Hi
-                , m5Lo = mb.m15Lo
-                , m6Hi = mb.m13Hi
-                , m6Lo = mb.m13Lo
-                , m7Hi = mb.m6Hi
-                , m7Lo = mb.m6Lo
-                , m8Hi = mb.m1Hi
-                , m8Lo = mb.m1Lo
-                , m9Hi = mb.m12Hi
-                , m9Lo = mb.m12Lo
-                , m10Hi = mb.m0Hi
-                , m10Lo = mb.m0Lo
-                , m11Hi = mb.m2Hi
-                , m11Lo = mb.m2Lo
-                , m12Hi = mb.m11Hi
-                , m12Lo = mb.m11Lo
-                , m13Hi = mb.m7Hi
-                , m13Lo = mb.m7Lo
-                , m14Hi = mb.m5Hi
-                , m14Lo = mb.m5Lo
-                , m15Hi = mb.m3Hi
-                , m15Lo = mb.m3Lo
-                }
+                { m0Hi = mb.m14Hi, m0Lo = mb.m14Lo, m1Hi = mb.m10Hi, m1Lo = mb.m10Lo, m2Hi = mb.m4Hi, m2Lo = mb.m4Lo, m3Hi = mb.m8Hi, m3Lo = mb.m8Lo, m4Hi = mb.m9Hi, m4Lo = mb.m9Lo, m5Hi = mb.m15Hi, m5Lo = mb.m15Lo, m6Hi = mb.m13Hi, m6Lo = mb.m13Lo, m7Hi = mb.m6Hi, m7Lo = mb.m6Lo, m8Hi = mb.m1Hi, m8Lo = mb.m1Lo, m9Hi = mb.m12Hi, m9Lo = mb.m12Lo, m10Hi = mb.m0Hi, m10Lo = mb.m0Lo, m11Hi = mb.m2Hi, m11Lo = mb.m2Lo, m12Hi = mb.m11Hi, m12Lo = mb.m11Lo, m13Hi = mb.m7Hi, m13Lo = mb.m7Lo, m14Hi = mb.m5Hi, m14Lo = mb.m5Lo, m15Hi = mb.m3Hi, m15Lo = mb.m3Lo }
                 vR0
 
         -- Round 2 (SIGMA[2] = { 11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4 })
         vR2 : WorkingVector
         vR2 =
             round
-                { m0Hi = mb.m11Hi
-                , m0Lo = mb.m11Lo
-                , m1Hi = mb.m8Hi
-                , m1Lo = mb.m8Lo
-                , m2Hi = mb.m12Hi
-                , m2Lo = mb.m12Lo
-                , m3Hi = mb.m0Hi
-                , m3Lo = mb.m0Lo
-                , m4Hi = mb.m5Hi
-                , m4Lo = mb.m5Lo
-                , m5Hi = mb.m2Hi
-                , m5Lo = mb.m2Lo
-                , m6Hi = mb.m15Hi
-                , m6Lo = mb.m15Lo
-                , m7Hi = mb.m13Hi
-                , m7Lo = mb.m13Lo
-                , m8Hi = mb.m10Hi
-                , m8Lo = mb.m10Lo
-                , m9Hi = mb.m14Hi
-                , m9Lo = mb.m14Lo
-                , m10Hi = mb.m3Hi
-                , m10Lo = mb.m3Lo
-                , m11Hi = mb.m6Hi
-                , m11Lo = mb.m6Lo
-                , m12Hi = mb.m7Hi
-                , m12Lo = mb.m7Lo
-                , m13Hi = mb.m1Hi
-                , m13Lo = mb.m1Lo
-                , m14Hi = mb.m9Hi
-                , m14Lo = mb.m9Lo
-                , m15Hi = mb.m4Hi
-                , m15Lo = mb.m4Lo
-                }
+                { m0Hi = mb.m11Hi, m0Lo = mb.m11Lo, m1Hi = mb.m8Hi, m1Lo = mb.m8Lo, m2Hi = mb.m12Hi, m2Lo = mb.m12Lo, m3Hi = mb.m0Hi, m3Lo = mb.m0Lo, m4Hi = mb.m5Hi, m4Lo = mb.m5Lo, m5Hi = mb.m2Hi, m5Lo = mb.m2Lo, m6Hi = mb.m15Hi, m6Lo = mb.m15Lo, m7Hi = mb.m13Hi, m7Lo = mb.m13Lo, m8Hi = mb.m10Hi, m8Lo = mb.m10Lo, m9Hi = mb.m14Hi, m9Lo = mb.m14Lo, m10Hi = mb.m3Hi, m10Lo = mb.m3Lo, m11Hi = mb.m6Hi, m11Lo = mb.m6Lo, m12Hi = mb.m7Hi, m12Lo = mb.m7Lo, m13Hi = mb.m1Hi, m13Lo = mb.m1Lo, m14Hi = mb.m9Hi, m14Lo = mb.m9Lo, m15Hi = mb.m4Hi, m15Lo = mb.m4Lo }
                 vR1
 
         -- Round 3 (SIGMA[3] = { 7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8 })
         vR3 : WorkingVector
         vR3 =
             round
-                { m0Hi = mb.m7Hi
-                , m0Lo = mb.m7Lo
-                , m1Hi = mb.m9Hi
-                , m1Lo = mb.m9Lo
-                , m2Hi = mb.m3Hi
-                , m2Lo = mb.m3Lo
-                , m3Hi = mb.m1Hi
-                , m3Lo = mb.m1Lo
-                , m4Hi = mb.m13Hi
-                , m4Lo = mb.m13Lo
-                , m5Hi = mb.m12Hi
-                , m5Lo = mb.m12Lo
-                , m6Hi = mb.m11Hi
-                , m6Lo = mb.m11Lo
-                , m7Hi = mb.m14Hi
-                , m7Lo = mb.m14Lo
-                , m8Hi = mb.m2Hi
-                , m8Lo = mb.m2Lo
-                , m9Hi = mb.m6Hi
-                , m9Lo = mb.m6Lo
-                , m10Hi = mb.m5Hi
-                , m10Lo = mb.m5Lo
-                , m11Hi = mb.m10Hi
-                , m11Lo = mb.m10Lo
-                , m12Hi = mb.m4Hi
-                , m12Lo = mb.m4Lo
-                , m13Hi = mb.m0Hi
-                , m13Lo = mb.m0Lo
-                , m14Hi = mb.m15Hi
-                , m14Lo = mb.m15Lo
-                , m15Hi = mb.m8Hi
-                , m15Lo = mb.m8Lo
-                }
+                { m0Hi = mb.m7Hi, m0Lo = mb.m7Lo, m1Hi = mb.m9Hi, m1Lo = mb.m9Lo, m2Hi = mb.m3Hi, m2Lo = mb.m3Lo, m3Hi = mb.m1Hi, m3Lo = mb.m1Lo, m4Hi = mb.m13Hi, m4Lo = mb.m13Lo, m5Hi = mb.m12Hi, m5Lo = mb.m12Lo, m6Hi = mb.m11Hi, m6Lo = mb.m11Lo, m7Hi = mb.m14Hi, m7Lo = mb.m14Lo, m8Hi = mb.m2Hi, m8Lo = mb.m2Lo, m9Hi = mb.m6Hi, m9Lo = mb.m6Lo, m10Hi = mb.m5Hi, m10Lo = mb.m5Lo, m11Hi = mb.m10Hi, m11Lo = mb.m10Lo, m12Hi = mb.m4Hi, m12Lo = mb.m4Lo, m13Hi = mb.m0Hi, m13Lo = mb.m0Lo, m14Hi = mb.m15Hi, m14Lo = mb.m15Lo, m15Hi = mb.m8Hi, m15Lo = mb.m8Lo }
                 vR2
 
         -- Round 4 (SIGMA[4] = { 9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13 })
         vR4 : WorkingVector
         vR4 =
             round
-                { m0Hi = mb.m9Hi
-                , m0Lo = mb.m9Lo
-                , m1Hi = mb.m0Hi
-                , m1Lo = mb.m0Lo
-                , m2Hi = mb.m5Hi
-                , m2Lo = mb.m5Lo
-                , m3Hi = mb.m7Hi
-                , m3Lo = mb.m7Lo
-                , m4Hi = mb.m2Hi
-                , m4Lo = mb.m2Lo
-                , m5Hi = mb.m4Hi
-                , m5Lo = mb.m4Lo
-                , m6Hi = mb.m10Hi
-                , m6Lo = mb.m10Lo
-                , m7Hi = mb.m15Hi
-                , m7Lo = mb.m15Lo
-                , m8Hi = mb.m14Hi
-                , m8Lo = mb.m14Lo
-                , m9Hi = mb.m1Hi
-                , m9Lo = mb.m1Lo
-                , m10Hi = mb.m11Hi
-                , m10Lo = mb.m11Lo
-                , m11Hi = mb.m12Hi
-                , m11Lo = mb.m12Lo
-                , m12Hi = mb.m6Hi
-                , m12Lo = mb.m6Lo
-                , m13Hi = mb.m8Hi
-                , m13Lo = mb.m8Lo
-                , m14Hi = mb.m3Hi
-                , m14Lo = mb.m3Lo
-                , m15Hi = mb.m13Hi
-                , m15Lo = mb.m13Lo
-                }
+                { m0Hi = mb.m9Hi, m0Lo = mb.m9Lo, m1Hi = mb.m0Hi, m1Lo = mb.m0Lo, m2Hi = mb.m5Hi, m2Lo = mb.m5Lo, m3Hi = mb.m7Hi, m3Lo = mb.m7Lo, m4Hi = mb.m2Hi, m4Lo = mb.m2Lo, m5Hi = mb.m4Hi, m5Lo = mb.m4Lo, m6Hi = mb.m10Hi, m6Lo = mb.m10Lo, m7Hi = mb.m15Hi, m7Lo = mb.m15Lo, m8Hi = mb.m14Hi, m8Lo = mb.m14Lo, m9Hi = mb.m1Hi, m9Lo = mb.m1Lo, m10Hi = mb.m11Hi, m10Lo = mb.m11Lo, m11Hi = mb.m12Hi, m11Lo = mb.m12Lo, m12Hi = mb.m6Hi, m12Lo = mb.m6Lo, m13Hi = mb.m8Hi, m13Lo = mb.m8Lo, m14Hi = mb.m3Hi, m14Lo = mb.m3Lo, m15Hi = mb.m13Hi, m15Lo = mb.m13Lo }
                 vR3
 
         -- Round 5 (SIGMA[5] = { 2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9 })
         vR5 : WorkingVector
         vR5 =
             round
-                { m0Hi = mb.m2Hi
-                , m0Lo = mb.m2Lo
-                , m1Hi = mb.m12Hi
-                , m1Lo = mb.m12Lo
-                , m2Hi = mb.m6Hi
-                , m2Lo = mb.m6Lo
-                , m3Hi = mb.m10Hi
-                , m3Lo = mb.m10Lo
-                , m4Hi = mb.m0Hi
-                , m4Lo = mb.m0Lo
-                , m5Hi = mb.m11Hi
-                , m5Lo = mb.m11Lo
-                , m6Hi = mb.m8Hi
-                , m6Lo = mb.m8Lo
-                , m7Hi = mb.m3Hi
-                , m7Lo = mb.m3Lo
-                , m8Hi = mb.m4Hi
-                , m8Lo = mb.m4Lo
-                , m9Hi = mb.m13Hi
-                , m9Lo = mb.m13Lo
-                , m10Hi = mb.m7Hi
-                , m10Lo = mb.m7Lo
-                , m11Hi = mb.m5Hi
-                , m11Lo = mb.m5Lo
-                , m12Hi = mb.m15Hi
-                , m12Lo = mb.m15Lo
-                , m13Hi = mb.m14Hi
-                , m13Lo = mb.m14Lo
-                , m14Hi = mb.m1Hi
-                , m14Lo = mb.m1Lo
-                , m15Hi = mb.m9Hi
-                , m15Lo = mb.m9Lo
-                }
+                { m0Hi = mb.m2Hi, m0Lo = mb.m2Lo, m1Hi = mb.m12Hi, m1Lo = mb.m12Lo, m2Hi = mb.m6Hi, m2Lo = mb.m6Lo, m3Hi = mb.m10Hi, m3Lo = mb.m10Lo, m4Hi = mb.m0Hi, m4Lo = mb.m0Lo, m5Hi = mb.m11Hi, m5Lo = mb.m11Lo, m6Hi = mb.m8Hi, m6Lo = mb.m8Lo, m7Hi = mb.m3Hi, m7Lo = mb.m3Lo, m8Hi = mb.m4Hi, m8Lo = mb.m4Lo, m9Hi = mb.m13Hi, m9Lo = mb.m13Lo, m10Hi = mb.m7Hi, m10Lo = mb.m7Lo, m11Hi = mb.m5Hi, m11Lo = mb.m5Lo, m12Hi = mb.m15Hi, m12Lo = mb.m15Lo, m13Hi = mb.m14Hi, m13Lo = mb.m14Lo, m14Hi = mb.m1Hi, m14Lo = mb.m1Lo, m15Hi = mb.m9Hi, m15Lo = mb.m9Lo }
                 vR4
 
         -- Round 6 (SIGMA[6] = { 12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11 })
         vR6 : WorkingVector
         vR6 =
             round
-                { m0Hi = mb.m12Hi
-                , m0Lo = mb.m12Lo
-                , m1Hi = mb.m5Hi
-                , m1Lo = mb.m5Lo
-                , m2Hi = mb.m1Hi
-                , m2Lo = mb.m1Lo
-                , m3Hi = mb.m15Hi
-                , m3Lo = mb.m15Lo
-                , m4Hi = mb.m14Hi
-                , m4Lo = mb.m14Lo
-                , m5Hi = mb.m13Hi
-                , m5Lo = mb.m13Lo
-                , m6Hi = mb.m4Hi
-                , m6Lo = mb.m4Lo
-                , m7Hi = mb.m10Hi
-                , m7Lo = mb.m10Lo
-                , m8Hi = mb.m0Hi
-                , m8Lo = mb.m0Lo
-                , m9Hi = mb.m7Hi
-                , m9Lo = mb.m7Lo
-                , m10Hi = mb.m6Hi
-                , m10Lo = mb.m6Lo
-                , m11Hi = mb.m3Hi
-                , m11Lo = mb.m3Lo
-                , m12Hi = mb.m9Hi
-                , m12Lo = mb.m9Lo
-                , m13Hi = mb.m2Hi
-                , m13Lo = mb.m2Lo
-                , m14Hi = mb.m8Hi
-                , m14Lo = mb.m8Lo
-                , m15Hi = mb.m11Hi
-                , m15Lo = mb.m11Lo
-                }
+                { m0Hi = mb.m12Hi, m0Lo = mb.m12Lo, m1Hi = mb.m5Hi, m1Lo = mb.m5Lo, m2Hi = mb.m1Hi, m2Lo = mb.m1Lo, m3Hi = mb.m15Hi, m3Lo = mb.m15Lo, m4Hi = mb.m14Hi, m4Lo = mb.m14Lo, m5Hi = mb.m13Hi, m5Lo = mb.m13Lo, m6Hi = mb.m4Hi, m6Lo = mb.m4Lo, m7Hi = mb.m10Hi, m7Lo = mb.m10Lo, m8Hi = mb.m0Hi, m8Lo = mb.m0Lo, m9Hi = mb.m7Hi, m9Lo = mb.m7Lo, m10Hi = mb.m6Hi, m10Lo = mb.m6Lo, m11Hi = mb.m3Hi, m11Lo = mb.m3Lo, m12Hi = mb.m9Hi, m12Lo = mb.m9Lo, m13Hi = mb.m2Hi, m13Lo = mb.m2Lo, m14Hi = mb.m8Hi, m14Lo = mb.m8Lo, m15Hi = mb.m11Hi, m15Lo = mb.m11Lo }
                 vR5
 
         -- Round 7 (SIGMA[7] = { 13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10 })
         vR7 : WorkingVector
         vR7 =
             round
-                { m0Hi = mb.m13Hi
-                , m0Lo = mb.m13Lo
-                , m1Hi = mb.m11Hi
-                , m1Lo = mb.m11Lo
-                , m2Hi = mb.m7Hi
-                , m2Lo = mb.m7Lo
-                , m3Hi = mb.m14Hi
-                , m3Lo = mb.m14Lo
-                , m4Hi = mb.m12Hi
-                , m4Lo = mb.m12Lo
-                , m5Hi = mb.m1Hi
-                , m5Lo = mb.m1Lo
-                , m6Hi = mb.m3Hi
-                , m6Lo = mb.m3Lo
-                , m7Hi = mb.m9Hi
-                , m7Lo = mb.m9Lo
-                , m8Hi = mb.m5Hi
-                , m8Lo = mb.m5Lo
-                , m9Hi = mb.m0Hi
-                , m9Lo = mb.m0Lo
-                , m10Hi = mb.m15Hi
-                , m10Lo = mb.m15Lo
-                , m11Hi = mb.m4Hi
-                , m11Lo = mb.m4Lo
-                , m12Hi = mb.m8Hi
-                , m12Lo = mb.m8Lo
-                , m13Hi = mb.m6Hi
-                , m13Lo = mb.m6Lo
-                , m14Hi = mb.m2Hi
-                , m14Lo = mb.m2Lo
-                , m15Hi = mb.m10Hi
-                , m15Lo = mb.m10Lo
-                }
+                { m0Hi = mb.m13Hi, m0Lo = mb.m13Lo, m1Hi = mb.m11Hi, m1Lo = mb.m11Lo, m2Hi = mb.m7Hi, m2Lo = mb.m7Lo, m3Hi = mb.m14Hi, m3Lo = mb.m14Lo, m4Hi = mb.m12Hi, m4Lo = mb.m12Lo, m5Hi = mb.m1Hi, m5Lo = mb.m1Lo, m6Hi = mb.m3Hi, m6Lo = mb.m3Lo, m7Hi = mb.m9Hi, m7Lo = mb.m9Lo, m8Hi = mb.m5Hi, m8Lo = mb.m5Lo, m9Hi = mb.m0Hi, m9Lo = mb.m0Lo, m10Hi = mb.m15Hi, m10Lo = mb.m15Lo, m11Hi = mb.m4Hi, m11Lo = mb.m4Lo, m12Hi = mb.m8Hi, m12Lo = mb.m8Lo, m13Hi = mb.m6Hi, m13Lo = mb.m6Lo, m14Hi = mb.m2Hi, m14Lo = mb.m2Lo, m15Hi = mb.m10Hi, m15Lo = mb.m10Lo }
                 vR6
 
         -- Round 8 (SIGMA[8] = { 6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5 })
         vR8 : WorkingVector
         vR8 =
             round
-                { m0Hi = mb.m6Hi
-                , m0Lo = mb.m6Lo
-                , m1Hi = mb.m15Hi
-                , m1Lo = mb.m15Lo
-                , m2Hi = mb.m14Hi
-                , m2Lo = mb.m14Lo
-                , m3Hi = mb.m9Hi
-                , m3Lo = mb.m9Lo
-                , m4Hi = mb.m11Hi
-                , m4Lo = mb.m11Lo
-                , m5Hi = mb.m3Hi
-                , m5Lo = mb.m3Lo
-                , m6Hi = mb.m0Hi
-                , m6Lo = mb.m0Lo
-                , m7Hi = mb.m8Hi
-                , m7Lo = mb.m8Lo
-                , m8Hi = mb.m12Hi
-                , m8Lo = mb.m12Lo
-                , m9Hi = mb.m2Hi
-                , m9Lo = mb.m2Lo
-                , m10Hi = mb.m13Hi
-                , m10Lo = mb.m13Lo
-                , m11Hi = mb.m7Hi
-                , m11Lo = mb.m7Lo
-                , m12Hi = mb.m1Hi
-                , m12Lo = mb.m1Lo
-                , m13Hi = mb.m4Hi
-                , m13Lo = mb.m4Lo
-                , m14Hi = mb.m10Hi
-                , m14Lo = mb.m10Lo
-                , m15Hi = mb.m5Hi
-                , m15Lo = mb.m5Lo
-                }
+                { m0Hi = mb.m6Hi, m0Lo = mb.m6Lo, m1Hi = mb.m15Hi, m1Lo = mb.m15Lo, m2Hi = mb.m14Hi, m2Lo = mb.m14Lo, m3Hi = mb.m9Hi, m3Lo = mb.m9Lo, m4Hi = mb.m11Hi, m4Lo = mb.m11Lo, m5Hi = mb.m3Hi, m5Lo = mb.m3Lo, m6Hi = mb.m0Hi, m6Lo = mb.m0Lo, m7Hi = mb.m8Hi, m7Lo = mb.m8Lo, m8Hi = mb.m12Hi, m8Lo = mb.m12Lo, m9Hi = mb.m2Hi, m9Lo = mb.m2Lo, m10Hi = mb.m13Hi, m10Lo = mb.m13Lo, m11Hi = mb.m7Hi, m11Lo = mb.m7Lo, m12Hi = mb.m1Hi, m12Lo = mb.m1Lo, m13Hi = mb.m4Hi, m13Lo = mb.m4Lo, m14Hi = mb.m10Hi, m14Lo = mb.m10Lo, m15Hi = mb.m5Hi, m15Lo = mb.m5Lo }
                 vR7
 
         -- Round 9 (SIGMA[9] = { 10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0 })
         vR9 : WorkingVector
         vR9 =
             round
-                { m0Hi = mb.m10Hi
-                , m0Lo = mb.m10Lo
-                , m1Hi = mb.m2Hi
-                , m1Lo = mb.m2Lo
-                , m2Hi = mb.m8Hi
-                , m2Lo = mb.m8Lo
-                , m3Hi = mb.m4Hi
-                , m3Lo = mb.m4Lo
-                , m4Hi = mb.m7Hi
-                , m4Lo = mb.m7Lo
-                , m5Hi = mb.m6Hi
-                , m5Lo = mb.m6Lo
-                , m6Hi = mb.m1Hi
-                , m6Lo = mb.m1Lo
-                , m7Hi = mb.m5Hi
-                , m7Lo = mb.m5Lo
-                , m8Hi = mb.m15Hi
-                , m8Lo = mb.m15Lo
-                , m9Hi = mb.m11Hi
-                , m9Lo = mb.m11Lo
-                , m10Hi = mb.m9Hi
-                , m10Lo = mb.m9Lo
-                , m11Hi = mb.m14Hi
-                , m11Lo = mb.m14Lo
-                , m12Hi = mb.m3Hi
-                , m12Lo = mb.m3Lo
-                , m13Hi = mb.m12Hi
-                , m13Lo = mb.m12Lo
-                , m14Hi = mb.m13Hi
-                , m14Lo = mb.m13Lo
-                , m15Hi = mb.m0Hi
-                , m15Lo = mb.m0Lo
-                }
+                { m0Hi = mb.m10Hi, m0Lo = mb.m10Lo, m1Hi = mb.m2Hi, m1Lo = mb.m2Lo, m2Hi = mb.m8Hi, m2Lo = mb.m8Lo, m3Hi = mb.m4Hi, m3Lo = mb.m4Lo, m4Hi = mb.m7Hi, m4Lo = mb.m7Lo, m5Hi = mb.m6Hi, m5Lo = mb.m6Lo, m6Hi = mb.m1Hi, m6Lo = mb.m1Lo, m7Hi = mb.m5Hi, m7Lo = mb.m5Lo, m8Hi = mb.m15Hi, m8Lo = mb.m15Lo, m9Hi = mb.m11Hi, m9Lo = mb.m11Lo, m10Hi = mb.m9Hi, m10Lo = mb.m9Lo, m11Hi = mb.m14Hi, m11Lo = mb.m14Lo, m12Hi = mb.m3Hi, m12Lo = mb.m3Lo, m13Hi = mb.m12Hi, m13Lo = mb.m12Lo, m14Hi = mb.m13Hi, m14Lo = mb.m13Lo, m15Hi = mb.m0Hi, m15Lo = mb.m0Lo }
                 vR8
 
         -- Round 10 (SIGMA[0] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 })
@@ -2021,39 +1689,7 @@ compress h t0Hi t0Lo t1Hi t1Lo isLastBlock mb =
         vR11 : WorkingVector
         vR11 =
             round
-                { m0Hi = mb.m14Hi
-                , m0Lo = mb.m14Lo
-                , m1Hi = mb.m10Hi
-                , m1Lo = mb.m10Lo
-                , m2Hi = mb.m4Hi
-                , m2Lo = mb.m4Lo
-                , m3Hi = mb.m8Hi
-                , m3Lo = mb.m8Lo
-                , m4Hi = mb.m9Hi
-                , m4Lo = mb.m9Lo
-                , m5Hi = mb.m15Hi
-                , m5Lo = mb.m15Lo
-                , m6Hi = mb.m13Hi
-                , m6Lo = mb.m13Lo
-                , m7Hi = mb.m6Hi
-                , m7Lo = mb.m6Lo
-                , m8Hi = mb.m1Hi
-                , m8Lo = mb.m1Lo
-                , m9Hi = mb.m12Hi
-                , m9Lo = mb.m12Lo
-                , m10Hi = mb.m0Hi
-                , m10Lo = mb.m0Lo
-                , m11Hi = mb.m2Hi
-                , m11Lo = mb.m2Lo
-                , m12Hi = mb.m11Hi
-                , m12Lo = mb.m11Lo
-                , m13Hi = mb.m7Hi
-                , m13Lo = mb.m7Lo
-                , m14Hi = mb.m5Hi
-                , m14Lo = mb.m5Lo
-                , m15Hi = mb.m3Hi
-                , m15Lo = mb.m3Lo
-                }
+                { m0Hi = mb.m14Hi, m0Lo = mb.m14Lo, m1Hi = mb.m10Hi, m1Lo = mb.m10Lo, m2Hi = mb.m4Hi, m2Lo = mb.m4Lo, m3Hi = mb.m8Hi, m3Lo = mb.m8Lo, m4Hi = mb.m9Hi, m4Lo = mb.m9Lo, m5Hi = mb.m15Hi, m5Lo = mb.m15Lo, m6Hi = mb.m13Hi, m6Lo = mb.m13Lo, m7Hi = mb.m6Hi, m7Lo = mb.m6Lo, m8Hi = mb.m1Hi, m8Lo = mb.m1Lo, m9Hi = mb.m12Hi, m9Lo = mb.m12Lo, m10Hi = mb.m0Hi, m10Lo = mb.m0Lo, m11Hi = mb.m2Hi, m11Lo = mb.m2Lo, m12Hi = mb.m11Hi, m12Lo = mb.m11Lo, m13Hi = mb.m7Hi, m13Lo = mb.m7Lo, m14Hi = mb.m5Hi, m14Lo = mb.m5Lo, m15Hi = mb.m3Hi, m15Lo = mb.m3Lo }
                 vR10
     in
     -- Finalize: h'[i] = h[i] XOR v[i] XOR v[i+8]
@@ -2134,60 +1770,28 @@ blockLoop acc =
 -- HASH FUNCTIONS
 
 
-emptyBytes : Bytes
-emptyBytes =
-    Encode.encode (Encode.sequence [])
-
-
 {-| Pre-decoded zero block (128 zero bytes), hoisted to module level.
 Used for empty unkeyed input where we compress a single zero block.
 -}
 zeroMessageBlock : MessageBlock
 zeroMessageBlock =
-    { m0Hi = 0
-    , m0Lo = 0
-    , m1Hi = 0
-    , m1Lo = 0
-    , m2Hi = 0
-    , m2Lo = 0
-    , m3Hi = 0
-    , m3Lo = 0
-    , m4Hi = 0
-    , m4Lo = 0
-    , m5Hi = 0
-    , m5Lo = 0
-    , m6Hi = 0
-    , m6Lo = 0
-    , m7Hi = 0
-    , m7Lo = 0
-    , m8Hi = 0
-    , m8Lo = 0
-    , m9Hi = 0
-    , m9Lo = 0
-    , m10Hi = 0
-    , m10Lo = 0
-    , m11Hi = 0
-    , m11Lo = 0
-    , m12Hi = 0
-    , m12Lo = 0
-    , m13Hi = 0
-    , m13Lo = 0
-    , m14Hi = 0
-    , m14Lo = 0
-    , m15Hi = 0
-    , m15Lo = 0
-    }
+    { m0Hi = 0, m0Lo = 0, m1Hi = 0, m1Lo = 0, m2Hi = 0, m2Lo = 0, m3Hi = 0, m3Lo = 0, m4Hi = 0, m4Lo = 0, m5Hi = 0, m5Lo = 0, m6Hi = 0, m6Lo = 0, m7Hi = 0, m7Lo = 0, m8Hi = 0, m8Lo = 0, m9Hi = 0, m9Lo = 0, m10Hi = 0, m10Lo = 0, m11Hi = 0, m11Lo = 0, m12Hi = 0, m12Lo = 0, m13Hi = 0, m13Lo = 0, m14Hi = 0, m14Lo = 0, m15Hi = 0, m15Lo = 0 }
 
 
-{-| Compute a BLAKE2b hash with the given digest length, key, and data.
+{-| Compute a BLAKE2b hash state for the given configuration and message.
 
-    - digestLength: 1 to 64 (number of output bytes)
+    - digestLength: 1 to 64 (affects the parameter block mixed into the initial state)
     - key: 0 to 64 bytes (use empty Bytes for unkeyed hashing)
-    - data: the message to hash
+    - data: the message to hash (passed as the second argument)
+
+The returned `HashState` can be encoded with [`stateToBytes`](#stateToBytes),
+[`stateToByteValues`](#stateToByteValues), [`stateToHex`](#stateToHex), or
+[`stateToBase64`](#stateToBase64), passing the same `digestLength` that was
+used here.
 
 -}
-hash : { digestLength : Int, key : Bytes, data : Bytes } -> Bytes
-hash config =
+hash : { digestLength : Int, key : Bytes } -> Bytes -> HashState
+hash config data =
     let
         keyLen : Int
         keyLen =
@@ -2195,7 +1799,7 @@ hash config =
 
         dataLen : Int
         dataLen =
-            Bytes.width config.data
+            Bytes.width data
 
         totalLen : Int
         totalLen =
@@ -2229,91 +1833,123 @@ hash config =
             , h7Hi = iv7Hi
             , h7Lo = iv7Lo
             }
+    in
+    if totalLen == 0 then
+        -- Empty unkeyed: compress one zero block with counter=0, final
+        compress initState 0 0 0 0 True zeroMessageBlock
 
-        finalState : HashState
-        finalState =
-            if totalLen == 0 then
-                -- Empty unkeyed: compress one zero block with counter=0, final
-                compress initState 0 0 0 0 True zeroMessageBlock
-
-            else
+    else
+        let
+            -- Pre-pad input to a multiple of 128 bytes so the loop always
+            -- reads full blocks. Avoids the pad+re-decode round-trip for
+            -- partial last blocks.
+            paddedData : Bytes
+            paddedData =
                 let
-                    -- Pre-pad input to a multiple of 128 bytes so the loop always
-                    -- reads full blocks. Avoids the pad+re-decode round-trip for
-                    -- partial last blocks.
-                    paddedData : Bytes
-                    paddedData =
-                        let
-                            -- Build full input data (key block prepended if keyed)
-                            fullData : Bytes
-                            fullData =
-                                if keyLen > 0 then
-                                    Encode.encode
-                                        (Encode.sequence
-                                            [ Encode.bytes config.key
-                                            , Encode.sequence (List.repeat (128 - keyLen) (Encode.unsignedInt8 0))
-                                            , Encode.bytes config.data
-                                            ]
-                                        )
-
-                                else
-                                    config.data
-
-                            remainder : Int
-                            remainder =
-                                remainderBy 128 totalLen
-                        in
-                        if remainder == 0 then
-                            fullData
-
-                        else
-                            let
-                                padNeeded : Int
-                                padNeeded =
-                                    128 - remainder
-
-                                zeroU32s : Int
-                                zeroU32s =
-                                    padNeeded // 4
-
-                                tailU8s : Int
-                                tailU8s =
-                                    remainderBy 4 padNeeded
-                            in
+                    -- Build full input data (key block prepended if keyed)
+                    fullData : Bytes
+                    fullData =
+                        if keyLen > 0 then
                             Encode.encode
                                 (Encode.sequence
-                                    [ Encode.bytes fullData
-                                    , Encode.sequence (List.repeat zeroU32s (Encode.unsignedInt32 LE 0))
-                                    , Encode.sequence (List.repeat tailU8s (Encode.unsignedInt8 0))
+                                    [ Encode.bytes config.key
+                                    , Encode.sequence (List.repeat (128 - keyLen) (Encode.unsignedInt8 0))
+                                    , Encode.bytes data
                                     ]
                                 )
+
+                        else
+                            data
+
+                    remainder : Int
+                    remainder =
+                        remainderBy 128 totalLen
                 in
-                case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) paddedData of
-                    Just hs ->
-                        hs
+                if remainder == 0 then
+                    fullData
 
-                    Nothing ->
-                        initState
-    in
-    encodeDigest config.digestLength finalState
+                else
+                    let
+                        padNeeded : Int
+                        padNeeded =
+                            128 - remainder
+
+                        zeroU32s : Int
+                        zeroU32s =
+                            padNeeded // 4
+
+                        tailU8s : Int
+                        tailU8s =
+                            remainderBy 4 padNeeded
+                    in
+                    Encode.encode
+                        (Encode.sequence
+                            [ Encode.bytes fullData
+                            , Encode.sequence (List.repeat zeroU32s (Encode.unsignedInt32 LE 0))
+                            , Encode.sequence (List.repeat tailU8s (Encode.unsignedInt8 0))
+                            ]
+                        )
+        in
+        case Decode.decode (Decode.loop { h = initState, t0Lo = 0, t0Hi = 0, remaining = totalLen } blockLoop) paddedData of
+            Just hs ->
+                hs
+
+            Nothing ->
+                initState
 
 
-{-| Compute a 512-bit (64-byte) BLAKE2b hash of the given data.
+{-| Encode a hash state as `Bytes`, truncated to `digestLength` bytes.
 -}
-hash512 : Bytes -> Bytes
-hash512 data =
-    hash { digestLength = 64, key = emptyBytes, data = data }
+stateToBytes : Int -> HashState -> Bytes
+stateToBytes digestLength state =
+    encodeDigest digestLength state
 
 
-{-| Compute a 256-bit (32-byte) BLAKE2b hash of the given data.
+{-| Encode a hash state as a hex string, truncated to `digestLength` bytes.
 -}
-hash256 : Bytes -> Bytes
-hash256 data =
-    hash { digestLength = 32, key = emptyBytes, data = data }
+stateToHex : Int -> HashState -> String
+stateToHex digestLength state =
+    Hex.fromBytes (encodeDigest digestLength state)
 
 
-{-| Compute a 224-bit (28-byte) BLAKE2b hash of the given data.
+{-| Encode a hash state as a base64 string, truncated to `digestLength` bytes.
 -}
-hash224 : Bytes -> Bytes
-hash224 data =
-    hash { digestLength = 28, key = emptyBytes, data = data }
+stateToBase64 : Int -> HashState -> String
+stateToBase64 digestLength state =
+    Base64.fromBytes (encodeDigest digestLength state)
+
+
+{-| Encode a hash state as a list of byte values (0-255), truncated to
+`digestLength` bytes. Extracts bytes directly from the 16 hi/lo Int fields
+without going through a `Bytes` round trip.
+-}
+stateToByteValues : Int -> HashState -> List Int
+stateToByteValues digestLength s =
+    List.take digestLength
+        (List.concat
+            [ wordToBytes s.h0Lo s.h0Hi
+            , wordToBytes s.h1Lo s.h1Hi
+            , wordToBytes s.h2Lo s.h2Hi
+            , wordToBytes s.h3Lo s.h3Hi
+            , wordToBytes s.h4Lo s.h4Hi
+            , wordToBytes s.h5Lo s.h5Hi
+            , wordToBytes s.h6Lo s.h6Hi
+            , wordToBytes s.h7Lo s.h7Hi
+            ]
+        )
+
+
+{-| Convert one 64-bit word (split into 32-bit hi/lo halves) into 8 bytes
+in little-endian order: lo byte 0..3 then hi byte 0..3.
+-}
+wordToBytes : Int -> Int -> List Int
+wordToBytes lo hi =
+    [ Bitwise.and 0xFF lo
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 8 lo)
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 16 lo)
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 24 lo)
+    , Bitwise.and 0xFF hi
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 8 hi)
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 16 hi)
+    , Bitwise.and 0xFF (Bitwise.shiftRightZfBy 24 hi)
+    ]
