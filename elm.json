@@ -3,7 +3,7 @@
     "name": "elm-cardano/blake2b",
     "summary": "Pure Elm BLAKE2b cryptographic hash (RFC 7693)",
     "license": "BSD-3-Clause",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "exposed-modules": [
         "Blake2b",
         "Blake2b224",
