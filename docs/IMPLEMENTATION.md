@@ -8,24 +8,30 @@ is emulated with hi/lo Int pairs.
 
 ```
 src/
-├── Blake2b.elm                    -- Public facade (re-exports V1)
+├── Blake2b.elm                    -- Configurable digest length + keyed hashing
+├── Blake2b224.elm                 -- BLAKE2b-224 (28-byte digest)
+├── Blake2b256.elm                 -- BLAKE2b-256 (32-byte digest)
+├── Blake2b512.elm                 -- BLAKE2b-512 (64-byte digest)
 ├── Blake2b/
-│   ├── V1.elm                     -- Current best implementation
-│   ├── V2.elm                     -- Experimental variant for A/B benchmarking
-│   └── Internal/
-│       ├── Constants.elm           -- 16 IV constants as top-level Ints
-│       ├── Decode.elm              -- Block decoder, digest encoder (for V1)
-│       └── DecodeV2.elm            -- Same decoder (for V2 isolation)
-src/Bench.elm                      -- elm-bench functions for V1 and V2
+│   ├── V1.elm                     -- Core implementation
+│   └── DecodeV1.elm               -- Block decoder, digest encoder
 ```
 
 ### Public API
 
+Each module (`Blake2b512`, `Blake2b256`, `Blake2b224`) exposes:
+
 ```elm
-hash : { digestLength : Int, key : Bytes, data : Bytes } -> Bytes
-hash512 : Bytes -> Bytes
-hash256 : Bytes -> Bytes
+fromString : String -> Digest
+fromBytes : Bytes -> Digest
+fromByteValues : List Int -> Digest
+toHex : Digest -> String
+toBase64 : Digest -> String
+toBytes : Digest -> Bytes
+toByteValues : Digest -> List Int
 ```
+
+The `Blake2b` module adds `{ digestLength, key }` configuration to each constructor.
 
 ### Algorithm Flow
 
@@ -68,9 +74,10 @@ Exactly 128 bytes is one block with counter=128.
 
 ### Block Decoder
 
-Uses quarter-block sub-decoders (4 words = 8 u32s each) to stay within Elm's
-F2..F9 fast path. Four `QuarterBlock` records are combined into the final
-`MessageBlock`. No function exceeds 8 arguments.
+Uses `Decode.map2` to decode each 64-bit word (lo/hi u32 pair) and
+`Decode.map4` to combine four words into a `QuarterBlock`. A final
+`Decode.map4` combines four `QuarterBlock`s into the 32-field `MessageBlock`.
+Zero `andThen` chains — all combining functions hit Elm's FN fast path.
 
 ### Round Function
 
@@ -141,6 +148,28 @@ loop always reads full blocks. Eliminates O(padLen) `List.repeat` + encode +
 re-decode per partial last block. Uses `unsignedInt32 LE 0` padding (4x fewer
 list allocations than per-byte). Also hoists `zeroMessageBlock` constant for
 empty-input path. Simplifies blockLoop from 3 branches to 2.
+
+#### V7: map2/map4 block decoder (23% faster than V6)
+
+Replaces `andThen` chains in block decoding with `Decode.map2`/`Decode.map4`.
+`decodeU64LE` uses `map2` for each lo/hi pair; `decodeQuarter` uses `map4`
+over 4 `decodeU64LE`; `blockDecoder` uses `map4` over 4 `decodeQuarter`.
+Eliminates 31 intermediate closures per block decode (7 andThen × 4 quarters
++ 3 andThen in blockDecoder), replaced by 16 U64 records + 4 QuarterBlock
+records.
+
+#### Failed: Extracting G mixing into functions
+
+Five variants tested, all slower than the fully-inlined round function:
+
+- Full G as F5 with ABCD record: +130%
+- Half-G pipeline as F3: +185%
+- Full G as F2 with ABCD + XY records: +147%
+- Half-G F3 + intermediate WorkingVector: +201%
+- Tiny U64 primitives as F4: +299%
+
+V8 does not perform scalar replacement on these records, so every extraction
+adds real heap allocation overhead.
 
 ### Benchmark Summary
 
@@ -219,15 +248,15 @@ empty-input path. Simplifies blockLoop from 3 branches to 2.
 
 ## Testing
 
-30 tests covering:
+Tests covering:
 
 - RFC 7693 vectors (empty string, "abc")
 - Self-test digest (Appendix E) — exercises all digest lengths, keyed + unkeyed,
   input lengths 0-255
 - KAT vectors (subset: 0, 1, 2, 63, 64, 127, 128, 129, 255 byte inputs)
-- Convenience functions (hash512, hash256)
+- Blake2b512, Blake2b256, Blake2b224 modules
 - Edge cases (0, 1, 127, 128, 129 bytes)
-- V2 cross-check (V1 and V2 produce identical output)
+- Bench V2 cross-check (V1 and V2 produce identical output)
 
 ## References
 

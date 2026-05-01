@@ -22,43 +22,36 @@ pnpm format:check  # check formatting
 pnpm format        # auto-format
 ```
 
-## Usage
+## API
+
+```elm
+import Blake2b512
+
+Blake2b512.fromString "hello"             -- Digest
+Blake2b512.fromBytes bytes                -- Digest
+Blake2b512.fromByteValues [0x68, 0x69]    -- Digest
+
+Blake2b512.toHex digest                   -- String
+Blake2b512.toBase64 digest                -- String
+Blake2b512.toBytes digest                 -- Bytes
+Blake2b512.toByteValues digest            -- List Int
+```
+
+The same API is exposed by `Blake2b224` and `Blake2b256`.
+
+For custom digest lengths or keyed hashing, use the `Blake2b` module:
 
 ```elm
 import Blake2b
-import Bytes exposing (Bytes)
-import Bytes.Encode
+import Bytes.Encode as Encode
 
-message : Bytes
-message =
-    Bytes.Encode.encode (Bytes.Encode.string "hello")
-
--- 512-bit hash (64 bytes), the default for BLAKE2b
-digest : Bytes
-digest =
-    Blake2b.hash512 message
-
--- 256-bit hash (32 bytes)
-digest256 : Bytes
-digest256 =
-    Blake2b.hash256 message
-
--- Custom digest length and keyed hashing
-keyed : Bytes
-keyed =
-    Blake2b.hash
-        { digestLength = 48
-        , key = Bytes.Encode.encode (Bytes.Encode.string "secret")
-        , data = message
-        }
+Blake2b.fromString
+    { digestLength = 48
+    , key = Encode.encode (Encode.string "secret")
+    }
+    "hello"
+    |> Blake2b.toHex
 ```
-
-## API
-
-- **`hash512 : Bytes -> Bytes`** — 512-bit (64-byte) hash
-- **`hash256 : Bytes -> Bytes`** — 256-bit (32-byte) hash
-- **`hash224 : Bytes -> Bytes`** — 224-bit (28-byte) hash
-- **`hash : { digestLength : Int, key : Bytes, data : Bytes } -> Bytes`** — configurable digest length (1-64) and optional key (0-64 bytes)
 
 ## Performance
 
